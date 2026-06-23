@@ -1,0 +1,15 @@
+[package]
+name = "frp2p-client-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "frp2p client GUI frontend (placeholder for v1)"
+
+[lib]
+path = "src/lib.rs"
+
+# v1: stub library. Future: GUI frontend (egui or iced).
+[dependencies]
+frp2p-common.workspace = true

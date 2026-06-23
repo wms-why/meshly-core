@@ -1,0 +1,13 @@
+[common]
+identity_path = "C:/Users/wutos/AppData/Local/Temp/frp2p-test/keys/server.key"
+
+[common.logging]
+level = "info"
+
+[[group]]
+name        = "homelab"
+group_token = "long-random-string-shared-with-clients"
+
+[heartbeat]
+interval_secs = 60
+timeout_secs  = 600

@@ -1,0 +1,23 @@
+server_node_id = "084fe921cdaf7cb8d71fd17a616538b6dd93bc17303b0419b5d61f27186bba55"
+group_token = "long-random-string-shared-with-clients"
+
+[common]
+identity_path = "C:/Users/wutos/AppData/Local/Temp/frp2p-test/keys/consumer.key"
+
+[common.logging]
+level = "info"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "ssh-secret"
+
+[[consume]]
+name = "web"
+local_bind = "127.0.0.1:19090"
+shared_secret = "web-secret"
+
+[reconnect]
+initial_backoff_ms = 50
+max_backoff_ms = 5000
+prefer_direct = true

@@ -1,0 +1,18 @@
+# frp2p client consume-only example.
+# Subscribes to a remote service exposed by a peer; never publishes.
+
+server_node_id = "REPLACE_WITH_SERVER_NODE_ID_HEX"
+group_token    = "long-random-string-shared-with-clients"
+
+[common.logging]
+level = "info"
+
+[[consume]]
+name          = "lan-db"
+local_bind    = "127.0.0.1:3307"
+shared_secret = "db-secret-from-remote-host"
+
+[reconnect]
+initial_backoff_ms = 50
+max_backoff_ms     = 5000
+prefer_direct      = true

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/server",
+    "crates/client",
+    "crates/client-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+authors = ["frp2p contributors"]
+
+[workspace.dependencies]
+# Core
+iroh = { version = "1.0", default-features = true }
+
+# Async runtime
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal", "fs"] }
+futures = "0.3"
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Paths
+dirs = "5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+
+# Crypto
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+hex = "0.4"
+
+# Encoding
+bytes = "1"
+
+# Concurrency
+dashmap = "6"
+
+# Internal
+frp2p-common = { path = "crates/common" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

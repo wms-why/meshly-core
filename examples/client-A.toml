@@ -1,0 +1,13 @@
+server_node_id = "084fe921cdaf7cb8d71fd17a616538b6dd93bc17303b0419b5d61f27186bba55"
+group_token = "long-random-string-shared-with-clients"
+
+[common]
+identity_path = "C:/Users/wutos/AppData/Local/Temp/frp2p-test/keys/provider.key"
+
+[common.logging]
+level = "info"
+
+[[expose]]
+name = "web"
+local_addr = "127.0.0.1:18081"
+shared_secret = "web-secret"

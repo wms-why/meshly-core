@@ -1,0 +1,18 @@
+# frp2p client expose-only example.
+# Publishes a local service; never consumes anything.
+
+server_node_id = "REPLACE_WITH_SERVER_NODE_ID_HEX"
+group_token    = "long-random-string-shared-with-clients"
+
+[common.logging]
+level = "info"
+
+[[expose]]
+name          = "ssh"
+local_addr    = "127.0.0.1:22"
+shared_secret = "ssh-secret"
+
+[reconnect]
+initial_backoff_ms = 50
+max_backoff_ms     = 5000
+prefer_direct      = true
