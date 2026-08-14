@@ -1,4 +1,4 @@
-# CLAUDE.md — frp2p
+# CLAUDE.md — meshly-core
 
 Guidance for Claude (or any agent) working in this repo.
 
@@ -8,18 +8,18 @@ A P2P frp-like tunnel tool written in Rust, built on top of
 [Iroh](https://github.com/n0-computer/iroh) for QUIC + NAT traversal.
 
 Three binaries from a Cargo workspace:
-- `frp2p-server` — control plane (registry) + data-plane relay fallback.
-- `frp2p-client` — single binary with two modes (`[[expose]]` and
+- `meshly-core-server` — control plane (registry) + data-plane relay fallback.
+- `meshly-core-client` — single binary with two modes (`[[expose]]` and
   `[[consume]]`) that can coexist in one process.
-- `frp2p-id` — print or generate the local Iroh NodeID.
+- `meshly-core-client id` — print or generate the local Iroh NodeID.
 
-Plus `frp2p-client-gui`, a placeholder library for a future GUI
+Plus `meshly-core-client-gui`, a placeholder library for a future GUI
 frontend (v1 ships an empty lib.rs).
 
 ## Workspace layout
 
 ```
-frp2p/
+meshly-core/
 ├── Cargo.toml                  # [workspace] + [workspace.dependencies]
 ├── crates/
 │   ├── common/                 # shared library (no main)
@@ -30,18 +30,17 @@ frp2p/
 │   │       ├── protocol.rs     # frame types (tag+len+payload), HMAC-SHA256 proof
 │   │       ├── tunnel.rs       # bridge() + BiStream wrapper (AsyncRead+AsyncWrite)
 │   │       └── config.rs       # serde RootConfig + validate()
-│   ├── server/                 # frp2p-server
+│   ├── server/                 # meshly-core-server
 │   │   └── src/
 │   │       ├── main.rs         # CLI + Endpoint bind + Router + heartbeat sweep
 │   │       ├── registry.rs     # ServerState / Group / Session / ServiceRecord
-│   │       ├── control.rs      # frp2p/control ProtocolHandler
-│   │       └── relay.rs        # frp2p/data ProtocolHandler (dumb byte relay)
-│   ├── client/                 # frp2p-client + frp2p-id
+│   │       ├── control.rs      # meshly-core/control ProtocolHandler
+│   │       └── relay.rs        # meshly-core/data ProtocolHandler (dumb byte relay)
+│   ├── client/                 # meshly-core-client
 │   │   └── src/
-│   │       ├── main.rs         # CLI + dual expose/consume setup
+│   │       ├── main.rs         # CLI (`run` + `id` subcommands) + dual expose/consume setup
 │   │       ├── expose.rs       # register + ProtocolHandler per service + ControlResponseHandler
-│   │       ├── consume.rs      # subscribe + local TCP listener + dial-with-fallback
-│   │       └── bin/id.rs       # frp2p-id binary
+│   │       └── consume.rs      # subscribe + local TCP listener + dial-with-fallback
 │   └── client-gui/             # placeholder lib for future GUI
 └── examples/                   # sample TOML configs (server, client-A, client-B, etc.)
 ```
@@ -56,19 +55,18 @@ cargo clippy --workspace -- -D warnings   # lint
 ```
 
 Pre-built release binaries in `target/release/`:
-- `frp2p-server.exe` / `frp2p-server`
-- `frp2p-client.exe` / `frp2p-client`
-- `frp2p-id.exe` / `frp2p-id`
+- `meshly-core-server.exe` / `meshly-core-server`
+- `meshly-core-client.exe` / `meshly-core-client` (with `id` subcommand)
 
 ## Architecture in 60 seconds
 
 ```
                  ┌─────────────────────────────┐
-                 │   Server (frp2p-server)     │
+                 │   Server (meshly-core-server)     │
                  │  - control plane registry   │
                  │  - data plane relay         │
-                 │  ALPN: frp2p/control        │
-                 │        frp2p/data           │
+                 │  ALPN: meshly-core/control        │
+                 │        meshly-core/data           │
                  └──────────┬──────────────────┘
                             │ register / subscribe
               ┌─────────────┼─────────────┐
@@ -78,16 +76,16 @@ Pre-built release binaries in `target/release/`:
        │ expose[] │   │ expose[] │   │ consume[]│
        │ consume[]│   │          │   │          │
        └────┬─────┘   └────┬─────┘   └────┬─────┘
-            │  frp2p/<svc> (direct P2P)   │
+            │  meshly-core/<svc> (direct P2P)   │
             └─────────────────────────────┘
 ```
 
-- **Direct path**: Consumer dials Provider on ALPN `frp2p/<service>`,
+- **Direct path**: Consumer dials Provider on ALPN `meshly-core/<service>`,
   runs an HMAC nonce handshake on the first bi-stream, then bridges
   raw bytes between a local TCP listener and the QUIC stream.
-- **Relay path**: Consumer dials Server on ALPN `frp2p/data`, sends
+- **Relay path**: Consumer dials Server on ALPN `meshly-core/data`, sends
   `DataOpen { target_service, target_provider }`, Server dials
-  Provider on `frp2p/<service>` and `copy_bidirectional`s between
+  Provider on `meshly-core/<service>` and `copy_bidirectional`s between
   the two bi-streams.
 - **Service discovery**: Client → Server (Hello + Subscribe) →
   Server replies with provider's NodeID.
@@ -106,9 +104,9 @@ Tag ranges:
                   RegisterOk / Subscribe / SubscribeOk / Heartbeat / Error)
 
 ### ALPN scheme
-- `frp2p/control` — control plane (client → server)
-- `frp2p/data` — relay (client → server)
-- `frp2p/<svc>` — direct P2P data (client ↔ client); `<svc>` must
+- `meshly-core/control` — control plane (client → server)
+- `meshly-core/data` — relay (client → server)
+- `meshly-core/<svc>` — direct P2P data (client ↔ client); `<svc>` must
   match `[a-z0-9-]{1,32}` and not be in the reserved list
   (`control`, `data`, `status`, `reload`, `admin`, `metrics`, `ping`).
 
@@ -118,7 +116,7 @@ Always service-bound so a proof for service A can't be replayed
 against service B. Comparison is constant-time via `subtle::ConstantTimeEq`.
 
 ### One Iroh connection per service
-Each `[[expose]]` gets one `Router::accept(frp2p/<name>, handler)`.
+Each `[[expose]]` gets one `Router::accept(meshly-core/<name>, handler)`.
 Each `[[consume]]` lazily dials one connection to the provider
 on that ALPN. Reconnect logic in `client::consume::acquire_or_dial`.
 
@@ -171,10 +169,12 @@ From the v1 end-to-end smoke test — see README "Known issues":
 2. **Heartbeat sweep is aggressive**: provider sessions expire when
    the relay rotates and the connection drops. Set
    `heartbeat.timeout_secs ≥ 600` for testing.
-3. **Client doesn't ping**: the client registers once and parks the
-   control connection. No proactive heartbeat writer on the client.
+3. **Client doesn't ping**: *(Fixed: client now has a 60s Heartbeat
+   writer; see `crates/client/src/main.rs:CLIENT_HEARTBEAT_INTERVAL`.)*
+   Previously the client registered once and parked the control
+   connection.
 4. **Same-identity collision**: server and clients share the default
-   `<config_dir>/frp2p/identity.key` if `[common].identity_path` is
+   `<config_dir>/meshly-core/identity.key` if `[common].identity_path` is
    unset. Always set distinct identity paths per process.
 
 ## Common tasks
@@ -199,10 +199,11 @@ Check in order:
 - Does the consumer's `subscribe` reach the same group as the
   provider's `register`? Both must present the same `group_token`.
 - Is the consumer's `server_node_id` the server's actual NodeID?
-  Re-run `frp2p-id` on the server host.
+  Re-run `meshly-core-client id` on the server host.
 
 ## Plan file
 
-Project plan lives at `~/.claude/plans/gleaming-meandering-cosmos.md`
-(read-only reference). Update it only when restructuring scope;
-in-flight tasks are tracked via TaskCreate / TaskUpdate instead.
+The active v1 hardening roadmap lives at
+`~/.claude/plans/linear-sniffing-blanket.md`. Update it only when
+restructuring scope; in-flight tasks are tracked via TaskCreate /
+TaskUpdate instead.

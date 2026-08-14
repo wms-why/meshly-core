@@ -1,8 +1,14 @@
-# frp2p client expose-only example.
+# meshly-core client expose-only example.
 # Publishes a local service; never consumes anything.
+# Replace `server_node_id` with the value printed by `meshly-core-client id` on the
+# server host. Set `[common].identity_path` to a path distinct from any
+# other meshly-core process on this machine.
 
-server_node_id = "REPLACE_WITH_SERVER_NODE_ID_HEX"
+server_node_id = "REPLACE_ME_WITH_SERVER_NODE_ID_FROM_meshly-core-client-id"
 group_token    = "long-random-string-shared-with-clients"
+
+[common]
+identity_path = "./keys/provider.key"
 
 [common.logging]
 level = "info"

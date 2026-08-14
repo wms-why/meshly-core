@@ -1,4 +1,4 @@
-//! Shared types and utilities for frp2p.
+//! Shared types and utilities for meshly-core.
 //!
 //! Modules are intentionally small and focused; both server and client crates
 //! depend on this library to avoid duplication of protocol definitions,

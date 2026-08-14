@@ -1,4 +1,4 @@
-//! Control-plane protocol handler (ALPN `frp2p/control`).
+//! Control-plane protocol handler (ALPN `meshly-core/control`).
 //!
 //! Each accepted Connection runs the following sequence:
 //!
@@ -18,7 +18,7 @@ use iroh::EndpointId;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use frp2p_common::protocol::{Frame, Register, Subscribe};
+use meshly_core_common::protocol::{Frame, Register, Subscribe};
 
 use crate::registry::{Group, ServerState};
 
@@ -95,7 +95,7 @@ impl ControlHandler {
 
         // 2. Send HelloOk.
         let session_id: u64 = rand::random();
-        Frame::HelloOk(frp2p_common::protocol::HelloOk { session_id })
+        Frame::HelloOk(meshly_core_common::protocol::HelloOk { session_id })
             .write_to(&mut send)
             .await?;
         let _ = send.shutdown().await;
@@ -187,7 +187,7 @@ impl ControlHandler {
                 }
                 info!(service = %reg.service, provider = %remote.fmt_short(),
                     "service registered");
-                Frame::RegisterOk(frp2p_common::protocol::RegisterOk {
+                Frame::RegisterOk(meshly_core_common::protocol::RegisterOk {
                     service: reg.service.clone(),
                 })
                 .write_to(send)
@@ -216,7 +216,7 @@ impl ControlHandler {
                 let provider_str = provider.to_string();
                 info!(service = %sub.service, provider = %provider_str,
                     "subscription resolved");
-                Frame::SubscribeOk(frp2p_common::protocol::SubscribeOk {
+                Frame::SubscribeOk(meshly_core_common::protocol::SubscribeOk {
                     service: sub.service.clone(),
                     provider_node_id: Some(provider_str),
                     relay_required: false,
@@ -226,7 +226,7 @@ impl ControlHandler {
             }
             None => {
                 warn!(service = %sub.service, "subscription: service not found");
-                Frame::SubscribeOk(frp2p_common::protocol::SubscribeOk {
+                Frame::SubscribeOk(meshly_core_common::protocol::SubscribeOk {
                     service: sub.service.clone(),
                     provider_node_id: None,
                     relay_required: false,
@@ -240,9 +240,6 @@ impl ControlHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Tag re-exports so callers can identify server-emitted frames in logs.
+// Tag constants are defined in `meshly_core_common::protocol` and used by both
+// the client and server through `Frame::tag()`. No re-exports needed here.
 // ---------------------------------------------------------------------------
-pub const TAG_HELLO_OK: u8 = frp2p_common::protocol::CONTROL_HELLO_OK;
-pub const TAG_REGISTER_OK: u8 = frp2p_common::protocol::CONTROL_REGISTER_OK;
-pub const TAG_SUBSCRIBE_OK: u8 = frp2p_common::protocol::CONTROL_SUBSCRIBE_OK;
-pub const TAG_HEARTBEAT: u8 = frp2p_common::protocol::CONTROL_HEARTBEAT;

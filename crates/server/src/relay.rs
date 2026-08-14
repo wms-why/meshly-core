@@ -1,4 +1,4 @@
-//! Relay protocol handler (ALPN `frp2p/data`).
+//! Relay protocol handler (ALPN `meshly-core/data`).
 //!
 //! Wire format on this ALPN:
 //!
@@ -6,7 +6,7 @@
 //! 2. Consumer writes a single `Frame::DataOpen { target_service,
 //!    target_provider, proof: [0u8; 32] }`. (proof is unused in v1.)
 //! 3. Server checks: target_service is registered and target_provider matches.
-//! 4. Server dials the provider on ALPN `frp2p/<target_service>` and opens a
+//! 4. Server dials the provider on ALPN `meshly-core/<target_service>` and opens a
 //!    bi-stream.
 //! 5. Server performs a dumb byte relay between the two bi-streams.
 
@@ -19,8 +19,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use frp2p_common::alpn::alpn_for_service;
-use frp2p_common::protocol::Frame;
+use meshly_core_common::alpn::alpn_for_service;
+use meshly_core_common::protocol::Frame;
 
 use crate::registry::ServerState;
 
@@ -141,12 +141,12 @@ fn parse_endpoint_id(s: &str) -> Option<EndpointId> {
     if let Ok(id) = s.parse::<EndpointId>() {
         return Some(id);
     }
-    if let Ok(bytes) = hex::decode(s) {
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            return iroh::PublicKey::from_bytes(&arr).ok();
-        }
+    if let Ok(bytes) = hex::decode(s)
+        && bytes.len() == 32
+    {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        return iroh::PublicKey::from_bytes(&arr).ok();
     }
     None
 }

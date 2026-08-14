@@ -2,10 +2,10 @@
 //!
 //! Two channels exist:
 //!
-//! 1. **Control plane** (`frp2p/control`, Client → Server): registration,
+//! 1. **Control plane** (`meshly-core/control`, Client → Server): registration,
 //!    subscription, heartbeat. Frames here carry identifiers and metadata.
 //!
-//! 2. **Data plane** (`frp2p/<svc>` direct or `frp2p/data` relayed): per-stream
+//! 2. **Data plane** (`meshly-core/<svc>` direct or `meshly-core/data` relayed): per-stream
 //!    authentication followed by a raw byte pipe. Only the first stream on a
 //!    connection needs to prove possession of the shared secret; subsequent
 //!    streams on the same connection are considered authenticated by
@@ -500,14 +500,14 @@ mod tests {
     fn json_payload_roundtrips() {
         let f = Frame::Hello(Hello {
             group_token: "tkn".into(),
-            client_info: "frp2p-client/0.1".into(),
+            client_info: "meshly-core-client/0.1".into(),
         });
         let payload = f.encode_payload().unwrap();
         let back = Frame::decode(CONTROL_HELLO, &payload).unwrap();
         match back {
             Frame::Hello(h) => {
                 assert_eq!(h.group_token, "tkn");
-                assert_eq!(h.client_info, "frp2p-client/0.1");
+                assert_eq!(h.client_info, "meshly-core-client/0.1");
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -2,12 +2,12 @@
 //!
 //! Flow on startup:
 //!
-//! 1. Open a control connection to the server (`frp2p/control`).
+//! 1. Open a control connection to the server (`meshly-core/control`).
 //! 2. Send `Hello { group_token, client_info }`, wait for `HelloOk`.
 //! 3. For each [[expose]] entry, register the service:
 //!    - send `Register { service }`; receive `RegisterOk`.
 //! 4. Register a per-service `ProtocolHandler` on the local Router that
-//!    accepts P2P connections on ALPN `frp2p/<service>`, runs the HMAC
+//!    accepts P2P connections on ALPN `meshly-core/<service>`, runs the HMAC
 //!    handshake with the consumer, then bridges to the local backend.
 //!
 //! The control connection also serves as a keep-alive: if it dies the
@@ -25,12 +25,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use frp2p_common::alpn::alpn_for_service;
-use frp2p_common::protocol::{
+use meshly_core_common::protocol::{
     compute_proof, verify_proof, AuthNonce, AuthOk, AuthProof, Frame, Hello, HelloOk, Register,
     RegisterOk,
 };
-use frp2p_common::tunnel::{bridge, BiStream};
+use meshly_core_common::tunnel::{bridge, BiStream};
 
 /// Description of one service to expose.
 #[derive(Debug, Clone)]
@@ -84,8 +83,8 @@ impl ExposeHandler {
         if !verify_proof(&self.spec.shared_secret, &self.spec.name, &nonce, &proof) {
             warn!(service = %self.spec.name, "expose: bad HMAC proof");
             // Send AuthErr so the peer can distinguish bad auth from EOF.
-            let _ = Frame::AuthErr(frp2p_common::protocol::AuthErr {
-                code: frp2p_common::protocol::AUTH_ERR_BAD_PROOF,
+            let _ = Frame::AuthErr(meshly_core_common::protocol::AuthErr {
+                code: meshly_core_common::protocol::AUTH_ERR_BAD_PROOF,
                 reason: "bad HMAC proof".into(),
             })
             .write_to(&mut send)
@@ -161,7 +160,7 @@ pub async fn register_with_server(
     services: &[ExposeSpec],
 ) -> Result<Connection> {
     let conn = endpoint
-        .connect(EndpointAddr::new(server_node_id), b"frp2p/control")
+        .connect(EndpointAddr::new(server_node_id), b"meshly-core/control")
         .await
         .context("connect to server control plane")?;
 
@@ -209,18 +208,13 @@ pub async fn register_with_server(
     Ok(conn)
 }
 
-/// Validate `name` against the ALPN rules and produce ALPN bytes.
-pub fn alpn_for(name: &str) -> Result<Vec<u8>> {
-    alpn_for_service(name).context("invalid service name")
-}
-
 /// Identity bootstrap helper for the client (same pattern as server).
 pub fn load_identity_for_client(
     identity_path: Option<&std::path::Path>,
 ) -> anyhow::Result<(iroh::SecretKey, String)> {
     let (key, paths) = match identity_path {
-        Some(p) => frp2p_common::load_or_generate_at(p)?,
-        None => frp2p_common::load_or_generate()?,
+        Some(p) => meshly_core_common::load_or_generate_at(p)?,
+        None => meshly_core_common::load_or_generate()?,
     };
     let node_id = key.public().to_string();
     tracing::info!(node_id = %node_id, identity = %paths.key_file.display(),

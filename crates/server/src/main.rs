@@ -1,4 +1,4 @@
-//! frp2p-server entry point.
+//! meshly-core-server entry point.
 
 mod control;
 mod relay;
@@ -15,10 +15,10 @@ use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use frp2p_common::alpn::{alpn_control, alpn_data};
+use meshly_core_common::alpn::{alpn_control, alpn_data};
 
 #[derive(Parser, Debug)]
-#[command(name = "frp2p-server", about = "frp2p server: control plane + data relay", version)]
+#[command(name = "meshly-core-server", about = "meshly-core server: control plane + data relay", version)]
 struct Cli {
     /// Path to TOML config file.
     #[arg(short, long, default_value = "server.toml")]
@@ -34,7 +34,7 @@ async fn main() -> ExitCode {
     match real_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("frp2p-server: error: {e:#}");
+            eprintln!("meshly-core-server: error: {e:#}");
             ExitCode::from(1)
         }
     }
@@ -44,7 +44,7 @@ async fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load config first so we can configure logging + identity in one place.
-    let cfg = frp2p_common::config::RootConfig::load(&cli.config)
+    let cfg = meshly_core_common::config::RootConfig::load(&cli.config)
         .with_context(|| format!("load config {}", cli.config.display()))?;
     if !cfg.is_server() {
         anyhow::bail!(
@@ -89,7 +89,7 @@ async fn real_main() -> Result<()> {
     let router = Router::builder(endpoint.clone())
         .accept(alpn_control(), control::ControlHandler {
             state: state.clone(),
-            config: control_cfg.clone(),
+            config: control_cfg,
         })
         .accept(alpn_data(), relay::RelayHandler {
             endpoint: endpoint.clone(),
@@ -102,10 +102,10 @@ async fn real_main() -> Result<()> {
         groups = cfg.groups.len(),
         alpn_control = %String::from_utf8_lossy(&alpn_control()),
         alpn_data = %String::from_utf8_lossy(&alpn_data()),
-        "frp2p-server ready"
+        "meshly-core-server ready"
     );
-    eprintln!("frp2p-server node id: {node_id}");
-    eprintln!("frp2p-server: ctrl-c to stop");
+    eprintln!("meshly-core-server node id: {node_id}");
+    eprintln!("meshly-core-server: ctrl-c to stop");
 
     // Heartbeat-timeout sweeper task.
     {
@@ -148,7 +148,7 @@ fn sweep_dead_sessions(state: &Arc<registry::ServerState>, timeout: Duration) {
 }
 
 fn print_status(state: &registry::ServerState, node_id: &str) {
-    let mut out = serde_json::json!({
+    let out = serde_json::json!({
         "node_id": node_id,
         "session_count": state.session_count(),
         "services": state.dump_services().into_iter()
@@ -159,6 +159,6 @@ fn print_status(state: &registry::ServerState, node_id: &str) {
             }))
             .collect::<Vec<_>>(),
     });
-    let s = serde_json::to_string_pretty(&mut out).unwrap_or_else(|_| "{}".into());
+    let s = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into());
     println!("{s}");
 }

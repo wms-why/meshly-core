@@ -1,6 +1,6 @@
 //! Generic bidirectional byte-pipe bridge.
 //!
-//! The core operation of frp2p is: take two streams that speak AsyncRead +
+//! The core operation of meshly-core is: take two streams that speak AsyncRead +
 //! AsyncWrite (one is typically a `tokio::net::TcpStream`, the other is
 //! typically a pair of Iroh `SendStream` / `RecvStream`) and copy bytes
 //! in both directions until either side closes.

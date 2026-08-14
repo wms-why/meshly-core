@@ -1,12 +1,12 @@
 //! ALPN byte string constants and helpers.
 //!
-//! Three ALPNs are reserved by frp2p:
+//! Three ALPNs are reserved by meshly-core:
 //!
 //! | ALPN              | Direction        | Purpose                                    |
 //! |-------------------|------------------|--------------------------------------------|
-//! | `frp2p/control`   | Client → Server  | Registration / subscription / heartbeat    |
-//! | `frp2p/data`      | Client → Server  | Relayed data tunnel (when P2P fails)       |
-//! | `frp2p/<svc>`     | Client ↔ Client  | Direct data tunnel for service `<svc>`     |
+//! | `meshly-core/control`   | Client → Server  | Registration / subscription / heartbeat    |
+//! | `meshly-core/data`      | Client → Server  | Relayed data tunnel (when P2P fails)       |
+//! | `meshly-core/<svc>`     | Client ↔ Client  | Direct data tunnel for service `<svc>`     |
 //!
 //! Service names are constrained to `[a-z0-9-]{1,32}` to keep ALPN bytes
 //! printable and to prevent collisions in future hierarchical namespaces.
@@ -14,10 +14,10 @@
 use thiserror::Error;
 
 /// ALPN used by clients to reach the server's control plane.
-pub const ALPN_CONTROL: &[u8] = b"frp2p/control";
+pub const ALPN_CONTROL: &[u8] = b"meshly-core/control";
 
 /// ALPN used by clients to reach the server's data relay (P2P fallback).
-pub const ALPN_DATA: &[u8] = b"frp2p/data";
+pub const ALPN_DATA: &[u8] = b"meshly-core/data";
 
 /// Returns the ALPN bytes for the control plane.
 #[inline]
@@ -33,10 +33,10 @@ pub fn alpn_data() -> Vec<u8> {
 
 /// Returns the ALPN bytes for direct P2P data transfer of `service`.
 ///
-/// Example: `alpn_for_service("ssh") == b"frp2p/ssh"`.
+/// Example: `alpn_for_service("ssh") == b"meshly-core/ssh"`.
 pub fn alpn_for_service(service: &str) -> Result<Vec<u8>, AlpnError> {
     validate_service_name(service)?;
-    Ok(format!("frp2p/{service}").into_bytes())
+    Ok(format!("meshly-core/{service}").into_bytes())
 }
 
 /// Errors returned when a service name fails validation.
@@ -74,7 +74,7 @@ pub fn validate_service_name(name: &str) -> Result<(), AlpnError> {
     if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         return Err(AlpnError::InvalidChars(name.to_string()));
     }
-    if RESERVED.iter().any(|r| *r == name) {
+    if RESERVED.contains(&name) {
         return Err(AlpnError::Reserved(name.to_string()));
     }
     Ok(())
@@ -86,8 +86,8 @@ mod tests {
 
     #[test]
     fn alpn_for_valid_service() {
-        assert_eq!(alpn_for_service("ssh").unwrap(), b"frp2p/ssh");
-        assert_eq!(alpn_for_service("my-web-1").unwrap(), b"frp2p/my-web-1");
+        assert_eq!(alpn_for_service("ssh").unwrap(), b"meshly-core/ssh");
+        assert_eq!(alpn_for_service("my-web-1").unwrap(), b"meshly-core/my-web-1");
     }
 
     #[test]

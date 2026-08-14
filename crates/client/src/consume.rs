@@ -4,8 +4,8 @@
 //!
 //! 1. Connect to server's control plane, send `Hello`, then `Subscribe`.
 //! 2. Read `SubscribeOk` to learn the provider's NodeID.
-//! 3. Dial the provider directly on ALPN `frp2p/<service>` (P2P path).
-//!    On failure, fall back to server relay on ALPN `frp2p/data`.
+//! 3. Dial the provider directly on ALPN `meshly-core/<service>` (P2P path).
+//!    On failure, fall back to server relay on ALPN `meshly-core/data`.
 //! 4. Open a local TCP listener; for each accepted connection, open a
 //!    new bi-stream on the (possibly relayed) provider connection and
 //!    bridge bytes both ways.
@@ -22,12 +22,12 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use frp2p_common::alpn::alpn_for_service;
-use frp2p_common::protocol::{
+use meshly_core_common::alpn::alpn_for_service;
+use meshly_core_common::protocol::{
     AuthNonce, AuthOk, AuthProof, AuthErr, Frame, Hello, HelloOk, Subscribe, SubscribeOk,
     AUTH_ERR_BAD_PROOF,
 };
-use frp2p_common::tunnel::{bridge, BiStream};
+use meshly_core_common::tunnel::{bridge, BiStream};
 
 use crate::expose::make_proof;
 
@@ -75,14 +75,14 @@ pub async fn subscribe(
     service: &str,
 ) -> Result<EndpointId> {
     let conn = endpoint
-        .connect(EndpointAddr::new(server_node_id), b"frp2p/control")
+        .connect(EndpointAddr::new(server_node_id), b"meshly-core/control")
         .await
         .context("connect to server control plane")?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     Frame::Hello(Hello {
         group_token: group_token.to_string(),
-        client_info: format!("frp2p-client/{}", env!("CARGO_PKG_VERSION")),
+        client_info: format!("meshly-core-client/{}", env!("CARGO_PKG_VERSION")),
     })
     .write_to(&mut send)
     .await?;
@@ -174,10 +174,10 @@ async fn forward_one(state: Arc<ConsumeState>, tcp: tokio::net::TcpStream) -> Re
 async fn acquire_or_dial(state: &Arc<ConsumeState>) -> Result<Connection> {
     {
         let guard = state.conn.lock().await;
-        if let Some(c) = guard.as_ref() {
-            if c.close_reason().is_none() {
-                return Ok(c.clone());
-            }
+        if let Some(c) = guard.as_ref()
+            && c.close_reason().is_none()
+        {
+            return Ok(c.clone());
         }
     }
     // Dial with retry + backoff. We resolve the provider id lazily on
@@ -268,11 +268,11 @@ async fn dial_provider(state: &Arc<ConsumeState>) -> Result<Connection> {
 }
 
 async fn dial_via_relay(state: &Arc<ConsumeState>, provider_id: EndpointId) -> Result<Connection> {
-    // Connect to server on frp2p/data ALPN. We open a fresh connection per
+    // Connect to server on meshly-core/data ALPN. We open a fresh connection per
     // forwarded stream (the server's relay handler expects this).
     let conn = state
         .endpoint
-        .connect(EndpointAddr::new(state.server_node_id), b"frp2p/data")
+        .connect(EndpointAddr::new(state.server_node_id), b"meshly-core/data")
         .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let svc = state.spec.name.clone();

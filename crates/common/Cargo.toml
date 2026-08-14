@@ -1,11 +1,11 @@
 [package]
-name = "frp2p-common"
+name = "meshly-core-common"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Shared types and utilities for frp2p (identity, ALPN, protocol, tunnel, config)"
+description = "Shared types and utilities for meshly-core (identity, ALPN, protocol, tunnel, config)"
 
 [dependencies]
 iroh.workspace = true

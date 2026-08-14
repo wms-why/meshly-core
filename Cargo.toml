@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-authors = ["frp2p contributors"]
+authors = ["meshly-core contributors"]
 
 [workspace.dependencies]
 # Core
@@ -54,7 +54,7 @@ bytes = "1"
 dashmap = "6"
 
 # Internal
-frp2p-common = { path = "crates/common" }
+meshly-core-common = { path = "crates/common" }
 
 [profile.release]
 lto = "thin"

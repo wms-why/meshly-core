@@ -1,6 +1,6 @@
 //! Configuration schema and validation.
 //!
-//! Both `frp2p-server` and `frp2p-client` load TOML files. The schema is
+//! Both `meshly-core-server` and `meshly-core-client` load TOML files. The schema is
 //! flattened: a single `RootConfig` discriminates between the two roles by
 //! which optional sections are present.
 
@@ -57,7 +57,7 @@ pub struct RootConfig {
 #[serde(deny_unknown_fields)]
 pub struct CommonConfig {
     /// Path to the persisted Iroh identity key. If `None`, the default
-    /// location `<config_dir>/frp2p/identity.key` is used.
+    /// location `<config_dir>/meshly-core/identity.key` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_path: Option<PathBuf>,
     #[serde(default)]

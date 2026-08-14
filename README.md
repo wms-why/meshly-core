@@ -1,10 +1,10 @@
-# frp2p
+# meshly-core
 
 A P2P frp-like reverse-proxy / port-forwarding tool written in Rust, using
 [Iroh](https://github.com/n0-computer/iroh) for QUIC connections, automatic
 NAT traversal, and end-to-end encryption.
 
-frp2p replaces the classic `frpc ↔ frps ↔ visitor` model with a simpler one:
+meshly-core replaces the classic `frpc ↔ frps ↔ visitor` model with a simpler one:
 
 - A central **server** owns the control plane (service registry) and a
   fallback data-plane relay for clients that cannot establish direct P2P.
@@ -17,11 +17,11 @@ Built without TUN/TAP — runs without root or admin privileges.
 ## Workspace layout
 
 ```
-frp2p/
+meshly-core/
 ├── crates/
 │   ├── common/      shared library (identity, ALPN, protocol, tunnel, config)
-│   ├── server/      frp2p-server binary
-│   ├── client/      frp2p-client + frp2p-id binaries
+│   ├── server/      meshly-core-server binary
+│   ├── client/      meshly-core-client binary (with `id` subcommand)
 │   └── client-gui/  placeholder for the future GUI frontend
 └── examples/        sample TOML configs
 ```
@@ -33,37 +33,38 @@ cargo build --release
 ```
 
 Binaries land in `target/release/`:
-- `frp2p-server` (or `frp2p-server.exe` on Windows)
-- `frp2p-client` (or `frp2p-client.exe`)
-- `frp2p-id`
+- `meshly-core-server` (or `meshly-core-server.exe` on Windows)
+- `meshly-core-client` (or `meshly-core-client.exe`)
 
 ## Quick start
 
-1. **Print the server's NodeID** (run on the host where `frp2p-server` will run):
+1. **Print the server's NodeID** (run on the host where `meshly-core-server` will run):
 
    ```bash
-   ./target/release/frp2p-id
-   # -> frp2p node id: <64 hex chars>
+   ./target/release/meshly-core-client id
+   # -> meshly-core node id: <64 hex chars>
    ```
 
 2. **Start the server**:
 
    ```bash
-   ./target/release/frp2p-server -c ./examples/server.toml
+   ./target/release/meshly-core-server -c ./examples/server.toml
    ```
 
 3. **Start a client** on a host that has the actual service to expose:
 
    ```bash
-   # Edit client-A.toml: set [common].identity_path and server_node_id
-   ./target/release/frp2p-client -c ./examples/client-A.toml
+   # Edit client-A.toml: paste the server's NodeID into server_node_id,
+   # and confirm [common].identity_path points to a file distinct from
+   # the server's. Default in the example is "./keys/provider.key".
+   ./target/release/meshly-core-client -c ./examples/client-A.toml
    ```
 
 4. **Start a consumer client** that wants to reach the exposed service:
 
    ```bash
    # Edit client-B.toml similarly.
-   ./target/release/frp2p-client -c ./examples/client-B.toml
+   ./target/release/meshly-core-client -c ./examples/client-B.toml
    ```
 
 5. **Verify**:
@@ -110,16 +111,15 @@ These are tracked from the v1 end-to-end smoke test on Windows
    - Have the client proactively re-register services on relay
      change events from Iroh.
 
-3. **Hand-rolled control session on the client.** The client currently
-   registers once on startup and then parks the connection with
-   `std::future::pending()`. If the connection dies the client
-   reconnects every 5s, but there's no proactive ping. Add a
-   periodic `Heartbeat` writer on the client side analogous to the
-   server's writer to keep the session alive through relay hops.
+3. **Hand-rolled control session on the client.** *(Fixed: v0.1.0+
+   proactive heartbeat.)* The client now runs a periodic `Heartbeat`
+   writer on the control connection (default 60s), analogous to the
+   server's writer. If the connection dies, the writer exits and the
+   outer loop reconnects.
 
 4. **Same-machine testing requires explicit `identity_path`.** Without
    distinct identity files in the TOML config, server and clients
-   share the default `<config_dir>/frp2p/identity.key` and end up
+   share the default `<config_dir>/meshly-core/identity.key` and end up
    with identical NodeIDs, which causes confusing `subscription:
    service not found` errors. Always set
    `[common].identity_path = "/path/to/distinct/key"` per process.
@@ -135,7 +135,7 @@ These are tracked from the v1 end-to-end smoke test on Windows
 - TCP only.
 - Auth: Iroh NodeID identity + per-service shared secret via
   HMAC-SHA256 nonce handshake on the first bi-stream of a connection.
-- One Iroh Connection per service (ALPN `frp2p/<name>`).
+- One Iroh Connection per service (ALPN `meshly-core/<name>`).
 - Group token required to register or subscribe.
 
 Not in v1: UDP, HTTP virtual hosting, TUN/TAP, per-stream auth,

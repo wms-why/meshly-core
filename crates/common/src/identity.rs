@@ -1,13 +1,13 @@
 //! Iroh `SecretKey` persistence and load/generate.
 //!
 //! The identity (a.k.a. the Iroh NodeID private key) is the long-lived secret
-//! that gives a frp2p node its stable public address. It must be persisted
+//! that gives a meshly-core node its stable public address. It must be persisted
 //! between runs so that other peers can keep addressing the same node.
 //!
 //! Storage location:
-//! - Linux:   `$XDG_CONFIG_HOME/frp2p/identity.key` (default `~/.config/frp2p/identity.key`)
-// - macOS:   `$HOME/Library/Application Support/frp2p/identity.key`
-// - Windows: `%APPDATA%/frp2p/identity.key`
+//! - Linux:   `$XDG_CONFIG_HOME/meshly-core/identity.key` (default `~/.config/meshly-core/identity.key`)
+// - macOS:   `$HOME/Library/Application Support/meshly-core/identity.key`
+// - Windows: `%APPDATA%/meshly-core/identity.key`
 //!
 //! On Unix, the file is written with mode 0o600. On Windows, ACLs are not
 //! modified; rely on the user's profile directory ACL instead.
@@ -35,7 +35,7 @@ fn decode_key(bytes: &[u8]) -> Result<SecretKey> {
 ///
 /// Returned from [`load_or_generate`] / [`load_or_generate_at`] so callers
 /// can log where the file lives (useful for diagnostics and the
-/// `frp2p-id` command).
+/// `meshly-core-client id` subcommand).
 #[derive(Debug, Clone)]
 pub struct IdentityPaths {
     /// Directory containing the identity key file.
@@ -47,7 +47,7 @@ pub struct IdentityPaths {
 /// Load an existing `SecretKey` from disk, or generate a fresh one and
 /// persist it. Returns the key plus the resolved paths.
 ///
-/// The default location is `<config_dir>/frp2p/identity.key` where
+/// The default location is `<config_dir>/meshly-core/identity.key` where
 /// `config_dir` comes from the `dirs` crate. On Unix we ensure the
 /// directory has mode 0o700 and the file has mode 0o600.
 pub fn load_or_generate() -> Result<(SecretKey, IdentityPaths)> {
@@ -102,7 +102,7 @@ pub fn load_or_generate_at(key_file: &Path) -> Result<(SecretKey, IdentityPaths)
 fn default_dir() -> Result<PathBuf> {
     let base = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine user config directory"))?;
-    Ok(base.join("frp2p"))
+    Ok(base.join("meshly-core"))
 }
 
 #[cfg(unix)]
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn roundtrip_key_at_tmp_path() {
         let tmp = std::env::temp_dir().join(format!(
-            "frp2p-test-{}-{:x}",
+            "meshly-core-test-{}-{:x}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn different_paths_yield_different_keys() {
         let tmp = std::env::temp_dir().join(format!(
-            "frp2p-test-{}-{:x}",
+            "meshly-core-test-{}-{:x}",
             std::process::id(),
             rand::random::<u64>() ^ 0xdeadbeef
         ));

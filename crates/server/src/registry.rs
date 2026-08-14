@@ -42,21 +42,17 @@ pub struct Group {
 
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub client_id: EndpointId,
-    pub group: String,
-    pub registered_services: Vec<String>,
     pub last_heartbeat: Instant,
 }
 
 #[derive(Debug, Clone)]
 pub struct ServiceRecord {
-    pub name: String,
     pub provider_id: EndpointId,
 }
 
 impl ServerState {
     /// Build a fresh registry from the configured group definitions.
-    pub fn new(groups: &[frp2p_common::config::GroupConfig]) -> Arc<Self> {
+    pub fn new(groups: &[meshly_core_common::config::GroupConfig]) -> Arc<Self> {
         let mut map = HashMap::with_capacity(groups.len());
         for g in groups {
             map.insert(
@@ -73,10 +69,9 @@ impl ServerState {
             !map.is_empty(),
             "server must have at least one group configured"
         );
-        let state = Arc::new(Self {
+        Arc::new(Self {
             inner: RwLock::new(ServerStateInner { groups: map }),
-        });
-        state
+        })
     }
 
     /// Look up a group by name. Returns `None` if unknown.
@@ -137,31 +132,15 @@ impl Group {
         let prev = self.services.insert(
             service.to_string(),
             ServiceRecord {
-                name: service.to_string(),
                 provider_id: provider,
             },
         );
         Ok(prev.map(|r| r.provider_id))
     }
 
-    /// Unregister a service previously registered by `provider`.
-    pub fn unregister_service(&self, service: &str, provider: EndpointId) -> bool {
-        if let Some(entry) = self.services.get(service) {
-            if entry.provider_id == provider {
-                drop(entry);
-                self.services.remove(service);
-                return true;
-            }
-        }
-        false
-    }
-
     /// Insert or update a session for `client`.
     pub fn touch_session(&self, client_id: EndpointId) {
         let mut entry = self.sessions.entry(client_id).or_insert_with(|| Session {
-            client_id,
-            group: self.name.clone(),
-            registered_services: Vec::new(),
             last_heartbeat: Instant::now(),
         });
         entry.last_heartbeat = Instant::now();
@@ -194,8 +173,8 @@ pub enum RegisterError {
 /// Identity bootstrap helper: load or generate the server's secret key.
 pub fn load_identity(identity_path: Option<&std::path::Path>) -> anyhow::Result<(SecretKey, String)> {
     let (key, paths) = match identity_path {
-        Some(p) => frp2p_common::load_or_generate_at(p)?,
-        None => frp2p_common::load_or_generate()?,
+        Some(p) => meshly_core_common::load_or_generate_at(p)?,
+        None => meshly_core_common::load_or_generate()?,
     };
     let node_id = key.public().to_string();
     tracing::info!(node_id = %node_id, identity = %paths.key_file.display(),

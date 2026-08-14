@@ -1,18 +1,18 @@
 [package]
-name = "frp2p-server"
+name = "meshly-core-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "frp2p server: control plane registry + data plane relay"
+description = "meshly-core server: control plane registry + data plane relay"
 
 [[bin]]
-name = "frp2p-server"
+name = "meshly-core-server"
 path = "src/main.rs"
 
 [dependencies]
-frp2p-common.workspace = true
+meshly-core-common.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

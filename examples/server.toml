@@ -1,5 +1,9 @@
+# meshly-core server example. Run on a host reachable by all clients in the
+# group. Each process MUST use a distinct identity_path or they will
+# share the default key file and end up with the same NodeID.
+
 [common]
-identity_path = "C:/Users/wutos/AppData/Local/Temp/frp2p-test/keys/server.key"
+identity_path = "./keys/server.key"
 
 [common.logging]
 level = "info"
