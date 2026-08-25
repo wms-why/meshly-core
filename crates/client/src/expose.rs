@@ -158,6 +158,7 @@ pub async fn register_with_server(
     group_token: &str,
     client_info: &str,
     services: &[ExposeSpec],
+    static_services: &[super::static_http::StaticSpec],
 ) -> Result<Connection> {
     let conn = endpoint
         .connect(EndpointAddr::new(server_node_id), b"meshly-core/control")
@@ -185,7 +186,7 @@ pub async fn register_with_server(
     let _ = send.shutdown().await;
     drop(recv);
 
-    // 2. Register each service on a fresh bi-stream.
+    // 2. Register each TCP-exposed service on a fresh bi-stream.
     for svc in services {
         let (mut s, mut r) = conn.open_bi().await?;
         Frame::Register(Register { service: svc.name.clone() })
@@ -194,7 +195,7 @@ pub async fn register_with_server(
         let resp = Frame::read_from(&mut r).await?;
         match resp {
             Frame::RegisterOk(RegisterOk { service }) => {
-                info!(service = %service, "server registered service");
+                info!(service = %service, "server registered expose service");
             }
             Frame::ControlError { code, reason } => {
                 anyhow::bail!("server rejected register({}): code={code} reason={reason}", svc.name);
@@ -202,6 +203,32 @@ pub async fn register_with_server(
             other => anyhow::bail!("unexpected frame after register: {other:?}"),
         }
         let _ = s.shutdown().await;
+        drop(r);
+    }
+
+    // 3. Register each static (HTTP) service the same way. The server side
+    //    treats them identically; consumers pick up the name and the kind
+    //    is surfaced to consumers as a regular service row (the `kind`
+    //    field distinguishes HTTP from TCP).
+    for s in static_services {
+        let (mut stream, mut r) = conn.open_bi().await?;
+        Frame::Register(Register { service: s.name.clone() })
+            .write_to(&mut stream)
+            .await?;
+        let resp = Frame::read_from(&mut r).await?;
+        match resp {
+            Frame::RegisterOk(RegisterOk { service }) => {
+                info!(service = %service, "server registered static service");
+            }
+            Frame::ControlError { code, reason } => {
+                anyhow::bail!(
+                    "server rejected register({} static): code={code} reason={reason}",
+                    s.name
+                );
+            }
+            other => anyhow::bail!("unexpected frame after register: {other:?}"),
+        }
+        let _ = stream.shutdown().await;
         drop(r);
     }
 

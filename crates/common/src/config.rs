@@ -44,6 +44,9 @@ pub struct RootConfig {
     /// Client-only: services to publish.
     #[serde(default, rename = "expose", skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<ExposeConfig>,
+    /// Client-only: HTTP static file services to publish.
+    #[serde(default, rename = "static", skip_serializing_if = "Vec::is_empty")]
+    pub static_services: Vec<StaticConfig>,
     /// Client-only: services to consume from peers in the group.
     #[serde(default, rename = "consume", skip_serializing_if = "Vec::is_empty")]
     pub consume: Vec<ConsumeConfig>,
@@ -121,6 +124,27 @@ pub struct ExposeConfig {
     pub name: String,
     /// Local backend address (e.g. `127.0.0.1:22`).
     pub local_addr: SocketAddr,
+    /// Shared secret that consumers must present to access this service.
+    pub shared_secret: String,
+}
+
+/// Client-side: an HTTP static file service to publish to the group.
+///
+/// On incoming P2P traffic, the client serves files rooted at
+/// `root_dir` over HTTP/1.1. If `allow_directory_listing` is true, GET
+/// on a directory returns an HTML index; otherwise it returns 403.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticConfig {
+    /// Service name (must satisfy `[a-z0-9-]{1,32}`).
+    pub name: String,
+    /// Local root directory to serve files from. Must exist and be a
+    /// directory at config load time.
+    pub root_dir: PathBuf,
+    /// When true, GET on a directory returns an HTML listing of its
+    /// children. When false, directories return 403.
+    #[serde(default)]
+    pub allow_directory_listing: bool,
     /// Shared secret that consumers must present to access this service.
     pub shared_secret: String,
 }
@@ -259,11 +283,24 @@ impl RootConfig {
         // Reject same name in both expose and consume (semantic ambiguity).
         let exp_names: std::collections::HashSet<_> =
             self.expose.iter().map(|e| e.name.as_str()).collect();
+        let static_names: std::collections::HashSet<_> = self
+            .static_services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         for c in &self.consume {
-            if exp_names.contains(c.name.as_str()) {
+            if exp_names.contains(c.name.as_str()) || static_names.contains(c.name.as_str()) {
                 return Err(v(format!(
-                    "service {:?} appears in both [[expose]] and [[consume]]",
+                    "service {:?} appears in both [[expose]] or [[static]] and [[consume]]",
                     c.name
+                )));
+            }
+        }
+        for e in &self.expose {
+            if static_names.contains(e.name.as_str()) {
+                return Err(v(format!(
+                    "service {:?} appears in both [[expose]] and [[static]]",
+                    e.name
                 )));
             }
         }
@@ -275,6 +312,31 @@ impl RootConfig {
             }
             // Pre-compute ALPN to fail fast on bad names.
             alpn_for_service(&e.name).map_err(|err| v(format!("expose {:?}: {err}", e.name)))?;
+        }
+        for s in &self.static_services {
+            validate_service_name(&s.name)
+                .map_err(|err| v(format!("static {:?}: {err}", s.name)))?;
+            if s.shared_secret.is_empty() {
+                return Err(v(format!(
+                    "static {:?}: shared_secret is empty",
+                    s.name
+                )));
+            }
+            if !s.root_dir.exists() {
+                return Err(v(format!(
+                    "static {:?}: root_dir {:?} does not exist",
+                    s.name,
+                    s.root_dir.display()
+                )));
+            }
+            if !s.root_dir.is_dir() {
+                return Err(v(format!(
+                    "static {:?}: root_dir {:?} is not a directory",
+                    s.name,
+                    s.root_dir.display()
+                )));
+            }
+            alpn_for_service(&s.name).map_err(|err| v(format!("static {:?}: {err}", s.name)))?;
         }
         for c in &self.consume {
             validate_service_name(&c.name).map_err(|err| v(format!("consume {:?}: {err}", c.name)))?;
@@ -417,6 +479,137 @@ group_token = "tok"
             ConfigError::Validate(s) => assert!(s.contains("logging.level")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_valid_static_entry() {
+        // Use this crate's source dir as a guaranteed-existing directory.
+        let here = std::env::current_dir().unwrap();
+        let cfg_str = format!(
+            r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[static]]
+name = "files"
+root_dir = "{}"
+shared_secret = "s"
+allow_directory_listing = true
+"#,
+            here.display().to_string().replace('\\', "\\\\")
+        );
+        let cfg = RootConfig::load_from_str(&cfg_str).unwrap();
+        assert_eq!(cfg.static_services.len(), 1);
+        assert_eq!(cfg.static_services[0].name, "files");
+        assert!(cfg.static_services[0].allow_directory_listing);
+    }
+
+    #[test]
+    fn static_defaults_allow_listing_to_false() {
+        let here = std::env::current_dir().unwrap();
+        let cfg_str = format!(
+            r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[static]]
+name = "files"
+root_dir = "{}"
+shared_secret = "s"
+"#,
+            here.display().to_string().replace('\\', "\\\\")
+        );
+        let cfg = RootConfig::load_from_str(&cfg_str).unwrap();
+        assert!(!cfg.static_services[0].allow_directory_listing);
+    }
+
+    #[test]
+    fn rejects_static_with_missing_root_dir() {
+        let bad = r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[static]]
+name = "files"
+root_dir = "/nope/this/does/not/exist/at/all"
+shared_secret = "s"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("root_dir")),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_static_with_root_dir_pointing_at_file() {
+        // Use Cargo.toml as a known file in the workspace.
+        let here = std::env::current_dir().unwrap();
+        let cfg_str = format!(
+            r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[static]]
+name = "files"
+root_dir = "{}/Cargo.toml"
+shared_secret = "s"
+"#,
+            here.display().to_string().replace('\\', "\\\\")
+        );
+        let err = RootConfig::load_from_str(&cfg_str).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("not a directory")),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_same_name_across_static_and_consume() {
+        let here = std::env::current_dir().unwrap();
+        let cfg_str = format!(
+            r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[static]]
+name = "files"
+root_dir = "{}"
+shared_secret = "s"
+
+[[consume]]
+name = "files"
+local_bind = "127.0.0.1:8080"
+shared_secret = "s"
+"#,
+            here.display().to_string().replace('\\', "\\\\")
+        );
+        let err = RootConfig::load_from_str(&cfg_str).unwrap_err();
+        assert!(matches!(err, ConfigError::Validate(_)));
+    }
+
+    #[test]
+    fn rejects_same_name_across_static_and_expose() {
+        let here = std::env::current_dir().unwrap();
+        let cfg_str = format!(
+            r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[expose]]
+name = "files"
+local_addr = "127.0.0.1:22"
+shared_secret = "s"
+
+[[static]]
+name = "files"
+root_dir = "{}"
+shared_secret = "s"
+"#,
+            here.display().to_string().replace('\\', "\\\\")
+        );
+        let err = RootConfig::load_from_str(&cfg_str).unwrap_err();
+        assert!(matches!(err, ConfigError::Validate(_)));
     }
 
     impl RootConfig {

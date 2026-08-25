@@ -21,8 +21,7 @@ meshly-core/
 ├── crates/
 │   ├── common/      shared library (identity, ALPN, protocol, tunnel, config)
 │   ├── server/      meshly-core-server binary
-│   ├── client/      meshly-core-client binary (with `id` subcommand)
-│   └── client-gui/  placeholder for the future GUI frontend
+│   └── client/      meshly-core-client binary (with `id` subcommand)
 └── examples/        sample TOML configs
 ```
 

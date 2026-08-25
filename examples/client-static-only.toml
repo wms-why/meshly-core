@@ -1,0 +1,31 @@
+# meshly-core client static-only example.
+# Publishes a local folder as an HTTP/1.1 file service. Consumers can
+# browse / download files served from `root_dir`.
+#
+# - `allow_directory_listing = true` renders an HTML index for GET on
+#   a directory. When false, directories return 403.
+# - `shared_secret` must be passed to consumers via meshly-web grants.
+#
+# Replace `server_node_id` with the value printed by
+# `meshly-core-client id` on the server host. Set `[common].identity_path`
+# to a path distinct from any other meshly-core process on this machine.
+
+server_node_id = "REPLACE_ME_WITH_SERVER_NODE_ID_FROM_meshly-core-client-id"
+group_token    = "long-random-string-shared-with-clients"
+
+[common]
+identity_path = "./keys/static-host.key"
+
+[common.logging]
+level = "info"
+
+[[static]]
+name                    = "files"
+root_dir                = "/Users/me/photos"
+allow_directory_listing = true
+shared_secret           = "long-random-string-shared-with-grantees"
+
+[reconnect]
+initial_backoff_ms = 50
+max_backoff_ms     = 5000
+prefer_direct      = true

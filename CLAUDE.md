@@ -2,6 +2,14 @@
 
 Guidance for Claude (or any agent) working in this repo.
 
+## Production URL
+
+`https://meshly.link` is the canonical public Worker domain. The
+`meshly-client` desktop app (Tauri 2 + React, a sibling repo at
+`../meshly-client/`) defaults to it via `VITE_MESHLY_WEB_URL`. Don't
+point docs or examples at a different domain unless you're explicitly
+describing a self-hosted install.
+
 ## What this project is
 
 A P2P frp-like tunnel tool written in Rust, built on top of
@@ -12,9 +20,6 @@ Three binaries from a Cargo workspace:
 - `meshly-core-client` — single binary with two modes (`[[expose]]` and
   `[[consume]]`) that can coexist in one process.
 - `meshly-core-client id` — print or generate the local Iroh NodeID.
-
-Plus `meshly-core-client-gui`, a placeholder library for a future GUI
-frontend (v1 ships an empty lib.rs).
 
 ## Workspace layout
 
@@ -41,7 +46,6 @@ meshly-core/
 │   │       ├── main.rs         # CLI (`run` + `id` subcommands) + dual expose/consume setup
 │   │       ├── expose.rs       # register + ProtocolHandler per service + ControlResponseHandler
 │   │       └── consume.rs      # subscribe + local TCP listener + dial-with-fallback
-│   └── client-gui/             # placeholder lib for future GUI
 └── examples/                   # sample TOML configs (server, client-A, client-B, etc.)
 ```
 

@@ -2,6 +2,7 @@
 
 mod consume;
 mod expose;
+mod static_http;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -176,12 +177,29 @@ async fn run_client(cli: RunArgs) -> Result<()> {
         router_builder = router_builder.accept(alpn, expose::ExposeHandler { spec });
         info!(service = %e.name, local_addr = %e.local_addr, "expose handler registered");
     }
+    for s in &cfg.static_services {
+        let spec = Arc::new(static_http::StaticSpec {
+            name: s.name.clone(),
+            root_dir: s.root_dir.clone(),
+            allow_directory_listing: s.allow_directory_listing,
+            shared_secret: s.shared_secret.as_bytes().to_vec(),
+        });
+        let alpn = meshly_core_common::alpn::alpn_for_service(&s.name)?;
+        router_builder = router_builder.accept(alpn, static_http::StaticHandler { spec });
+        info!(
+            service = %s.name,
+            root_dir = %s.root_dir.display(),
+            allow_directory_listing = s.allow_directory_listing,
+            "static handler registered"
+        );
+    }
     let _router = router_builder.spawn();
 
     info!(
         node_id = %node_id,
         server = %server_node_id.fmt_short(),
         exposes = cfg.expose.len(),
+        static_services = cfg.static_services.len(),
         consumes = cfg.consume.len(),
         "meshly-core-client ready"
     );
@@ -202,6 +220,16 @@ async fn run_client(cli: RunArgs) -> Result<()> {
             shared_secret: e.shared_secret.as_bytes().to_vec(),
         })
         .collect();
+    let static_specs: Vec<_> = cfg
+        .static_services
+        .iter()
+        .map(|s| static_http::StaticSpec {
+            name: s.name.clone(),
+            root_dir: s.root_dir.clone(),
+            allow_directory_listing: s.allow_directory_listing,
+            shared_secret: s.shared_secret.as_bytes().to_vec(),
+        })
+        .collect();
 
     {
         let endpoint = endpoint.clone();
@@ -213,6 +241,7 @@ async fn run_client(cli: RunArgs) -> Result<()> {
                     &group_token,
                     &client_info,
                     &expose_specs,
+                    &static_specs,
                 )
                 .await
                 {
@@ -289,6 +318,11 @@ fn print_status(cfg: &RootConfig, node_id: &str) {
         "expose": cfg.expose.iter().map(|e| serde_json::json!({
             "name": e.name,
             "local_addr": e.local_addr.to_string(),
+        })).collect::<Vec<_>>(),
+        "static": cfg.static_services.iter().map(|s| serde_json::json!({
+            "name": s.name,
+            "root_dir": s.root_dir.display().to_string(),
+            "allow_directory_listing": s.allow_directory_listing,
         })).collect::<Vec<_>>(),
         "consume": cfg.consume.iter().map(|c| serde_json::json!({
             "name": c.name,
