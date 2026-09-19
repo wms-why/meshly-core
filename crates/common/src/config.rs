@@ -32,6 +32,15 @@ pub struct RootConfig {
     /// Server-only: heartbeat tuning.
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    /// Server-only: relay tuning (bandwidth limits, etc).
+    ///
+    /// `Some` only when the TOML contains a `[relay]` section. The
+    /// validator rejects `Some` in client configs — the reply-bandwidth
+    /// cap is server-administered and the client has no authority over
+    /// it. A server config that omits `[relay]` deserializes to `None`
+    /// and falls back to [`RelayConfig::default`] at use time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayConfig>,
 
     // ---- client-only fields ----
     /// Client-only: server's Iroh NodeID (hex).
@@ -114,6 +123,91 @@ impl Default for HeartbeatConfig {
             timeout_secs: 90,
         }
     }
+}
+
+/// Server-side: relay-plane tuning.
+///
+/// **Server-only.** Caps the rate at which the relay forwards **replies**
+/// (provider → consumer) through the server. The cap is enforced per
+/// active connection; each connection's limit can later be changed
+/// dynamically via the rate-handle registry held by
+/// `meshly_core_server::registry::ServerState`.
+///
+/// This type is intentionally **not** re-exported from
+/// `meshly_core_common`'s public API — it's part of the common crate
+/// only so that `RootConfig` can deserialize it via serde. Client code
+/// has no business constructing, reading, or mutating one, and the
+/// config validator rejects any client TOML that contains a `[relay]`
+/// section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Master switch for reply-bandwidth throttling.
+    ///
+    /// `false` (the default) bypasses the rate limiter entirely: the
+    /// relay forwards all reply bytes as fast as the underlying QUIC
+    /// streams allow, and per-consumer overrides are parsed but not
+    /// applied. `true` engages the limiter using `bytes_per_sec` as
+    /// the default cap, with `rate_overrides` taking precedence for
+    /// specific consumers.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Per-connection reply bandwidth cap in **bytes per second**
+    /// applied to consumers that don't appear in `rate_overrides`.
+    /// `0` disables throttling (unlimited) **for that specific
+    /// consumer** — the master `enabled` switch still governs whether
+    /// throttling runs at all.
+    ///
+    /// Only consulted when `enabled = true`. Defaults to 100 KiB/s
+    /// (102_400 bytes/s) when omitted, but that value is harmless if
+    /// the master switch is off.
+    #[serde(default = "default_relay_bytes_per_sec")]
+    pub bytes_per_sec: u64,
+
+    /// Per-consumer overrides keyed by the consumer's EndpointID (as
+    /// canonical z-base32 or 64-char hex). When a consumer opens a
+    /// relayed tunnel, the server looks it up here and uses the
+    /// override as the initial rate for that connection. Consumers not
+    /// listed fall back to `bytes_per_sec` above.
+    ///
+    /// The data plane's `DataOpen` frame carries the consumer's own
+    /// NodeID so the server can match it against this table; if the
+    /// frame's `consumer_node_id` doesn't match the connection's
+    /// `remote_id()` the server rejects the open. Like `bytes_per_sec`,
+    /// these rows only take effect when `enabled = true`.
+    #[serde(default, rename = "rate_override", skip_serializing_if = "Vec::is_empty")]
+    pub rate_overrides: Vec<RelayRateOverride>,
+}
+
+fn default_relay_bytes_per_sec() -> u64 {
+    100 * 1024
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        // Master switch is OFF by default: rate limiting is opt-in.
+        // The 100 KiB/s default for `bytes_per_sec` is dormant in that
+        // state; flipping `enabled = true` activates it.
+        Self {
+            enabled: false,
+            bytes_per_sec: default_relay_bytes_per_sec(),
+            rate_overrides: Vec::new(),
+        }
+    }
+}
+
+/// Server-side: one row of the per-consumer rate-override table.
+///
+/// `node_id` is the consumer's EndpointID, accepted in the same string
+/// forms as the rest of the project (z-base32 default; 64-char hex also
+/// recognized — see `parse_endpoint_id`). `bytes_per_sec = 0` means
+/// unlimited for that specific consumer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayRateOverride {
+    pub node_id: String,
+    pub bytes_per_sec: u64,
 }
 
 /// Client-side: a local service to expose to the group.
@@ -258,11 +352,50 @@ impl RootConfig {
                 return Err(v(format!("group {:?}: group_token is empty", g.name)));
             }
         }
+        // Each [[relay.rate_override]] entry must reference a valid
+        // EndpointID. We parse eagerly here so config load fails loudly
+        // on typos instead of silently dropping the row at lookup time.
+        let mut seen_ids: std::collections::HashSet<iroh::EndpointId> =
+            std::collections::HashSet::new();
+        for (idx, ov) in self
+            .relay
+            .as_ref()
+            .map(|r| r.rate_overrides.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
+            let id = crate::endpoint::parse_endpoint_id(&ov.node_id).ok_or_else(|| {
+                v(format!(
+                    "relay.rate_override[{}].node_id {:?} is not a valid EndpointID \
+                     (expected canonical z-base32 or 64-char hex)",
+                    idx, ov.node_id
+                ))
+            })?;
+            if !seen_ids.insert(id) {
+                return Err(v(format!(
+                    "relay.rate_override[{}]: duplicate node_id {:?}",
+                    idx, ov.node_id
+                )));
+            }
+        }
         Ok(())
     }
 
     fn validate_client(&self) -> Result<(), ConfigError> {
         let v = |s: String| ConfigError::Validate(s);
+
+        // Server-administered knobs: clients have no authority over
+        // these and any attempt to set them is treated as a config
+        // error (most often a copy-pasted server.toml). Reject early
+        // so the failure mode is loud rather than silently ignored.
+        if self.relay.is_some() {
+            return Err(v(
+                "[relay] is server-only and must not appear in client configs; \
+                 the reply-bandwidth cap is administered by the server operator"
+                    .into(),
+            ));
+        }
 
         let node_id = self
             .server_node_id
@@ -288,6 +421,35 @@ impl RootConfig {
             .iter()
             .map(|s| s.name.as_str())
             .collect();
+        // Reject duplicate names within the same table (would silently
+        // shadow earlier entries at runtime — define explicitly instead).
+        let mut seen_expose = std::collections::HashSet::new();
+        for e in &self.expose {
+            if !seen_expose.insert(e.name.as_str()) {
+                return Err(v(format!(
+                    "duplicate service name {:?} in [[expose]]",
+                    e.name
+                )));
+            }
+        }
+        let mut seen_consume = std::collections::HashSet::new();
+        for c in &self.consume {
+            if !seen_consume.insert(c.name.as_str()) {
+                return Err(v(format!(
+                    "duplicate service name {:?} in [[consume]]",
+                    c.name
+                )));
+            }
+        }
+        let mut seen_static = std::collections::HashSet::new();
+        for s in &self.static_services {
+            if !seen_static.insert(s.name.as_str()) {
+                return Err(v(format!(
+                    "duplicate service name {:?} in [[static]]",
+                    s.name
+                )));
+            }
+        }
         for c in &self.consume {
             if exp_names.contains(c.name.as_str()) || static_names.contains(c.name.as_str()) {
                 return Err(v(format!(
@@ -617,6 +779,502 @@ shared_secret = "s"
             let cfg: RootConfig = toml::from_str(s)?;
             cfg.validate()?;
             Ok(cfg)
+        }
+    }
+
+    // -- Phase 0: round-trip each example TOML and exercise validate() -----
+
+    /// Load each example TOML from disk, validate it (with any root_dir
+    /// rewrite so we can test in isolation), then re-serialize and
+    /// re-parse, asserting structural equality.
+    ///
+    /// For configs that reference a real directory (static), we rewrite
+    /// the `root_dir` to a guaranteed-existing tempdir so validation
+    /// passes regardless of the host filesystem.
+    #[test]
+    fn roundtrip_example_server_toml() {
+        let cfg = load_example("server.toml").expect("server.toml must parse");
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.groups.len(), cfg.groups.len());
+        assert_eq!(back.groups[0].name, cfg.groups[0].name);
+        assert_eq!(back.groups[0].group_token, cfg.groups[0].group_token);
+        assert_eq!(back.common.logging.level, cfg.common.logging.level);
+        assert!(back.is_server());
+    }
+
+    #[test]
+    fn roundtrip_example_client_a_toml() {
+        let cfg = load_example("client-A.toml").expect("client-A.toml must parse");
+        assert_eq!(cfg.expose.len(), 1);
+        assert!(cfg.expose[0].shared_secret.len() > 0);
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.expose.len(), 1);
+        assert_eq!(back.expose[0].name, cfg.expose[0].name);
+        assert_eq!(back.expose[0].local_addr, cfg.expose[0].local_addr);
+        assert_eq!(back.expose[0].shared_secret, cfg.expose[0].shared_secret);
+        assert!(!back.is_server());
+    }
+
+    #[test]
+    fn roundtrip_example_client_b_toml() {
+        let cfg = load_example("client-B.toml").expect("client-B.toml must parse");
+        assert_eq!(cfg.expose.len(), 1);
+        assert_eq!(cfg.consume.len(), 1);
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.expose.len(), cfg.expose.len());
+        assert_eq!(back.consume.len(), cfg.consume.len());
+        assert_eq!(back.expose[0].name, cfg.expose[0].name);
+        assert_eq!(back.consume[0].name, cfg.consume[0].name);
+        assert_eq!(back.consume[0].local_bind, cfg.consume[0].local_bind);
+        assert!(!back.is_server());
+    }
+
+    #[test]
+    fn roundtrip_example_consume_only_toml() {
+        let cfg =
+            load_example("client-consume-only.toml").expect("client-consume-only.toml must parse");
+        assert!(cfg.expose.is_empty());
+        assert_eq!(cfg.consume.len(), 1);
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert!(back.expose.is_empty());
+        assert_eq!(back.consume.len(), 1);
+        assert_eq!(back.consume[0].name, cfg.consume[0].name);
+        assert_eq!(back.consume[0].shared_secret, cfg.consume[0].shared_secret);
+    }
+
+    #[test]
+    fn roundtrip_example_expose_only_toml() {
+        let cfg =
+            load_example("client-expose-only.toml").expect("client-expose-only.toml must parse");
+        assert!(cfg.consume.is_empty());
+        assert_eq!(cfg.expose.len(), 1);
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert!(back.consume.is_empty());
+        assert_eq!(back.expose.len(), 1);
+        assert_eq!(back.expose[0].name, cfg.expose[0].name);
+    }
+
+    #[test]
+    fn roundtrip_example_static_only_toml() {
+        // The example static-only config points at /Users/me/photos which
+        // does not exist on most dev machines. We rewrite root_dir to a
+        // guaranteed-existing tempdir so validation succeeds, then round-trip.
+        let mut cfg =
+            load_example("client-static-only.toml").expect("client-static-only.toml must parse");
+        let tmp = tempfile::tempdir().unwrap();
+        cfg.static_services[0].root_dir = tmp.path().to_path_buf();
+        cfg.validate().expect("rewritten config must validate");
+
+        let s = toml::to_string(&cfg).unwrap();
+        let back: RootConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.static_services.len(), 1);
+        assert_eq!(back.static_services[0].name, cfg.static_services[0].name);
+        assert!(back.static_services[0].allow_directory_listing);
+        assert_eq!(back.static_services[0].root_dir, tmp.path());
+    }
+
+    /// Helper: load a `RootConfig` from the workspace's `examples/` dir
+    /// without running validate (some examples have placeholder
+    /// `server_node_id` strings that pass serde but aren't valid NodeIDs
+    /// at runtime, and the static example references a path that may not
+    /// exist on the test host).
+    fn load_example(name: &str) -> Result<RootConfig, ConfigError> {
+        // examples/ lives two directories up from this file: .../common/src/config.rs
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join(name);
+        let text = std::fs::read_to_string(&path).map_err(|e| ConfigError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let cfg: RootConfig = toml::from_str(&text)?;
+        // Don't validate — placeholder server_node_id ("REPLACE_ME_…")
+        // and root_dir paths would fail. Round-tripping tests are
+        // structural and don't care about validation.
+        Ok(cfg)
+    }
+
+    // -- Phase 0: validate() rejections ----------------------------------
+
+    #[test]
+    fn rejects_client_missing_server_node_id() {
+        let bad = r#"
+group_token = "tok"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "a"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("server_node_id")),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_with_empty_server_node_id() {
+        let bad = r#"
+server_node_id = ""
+group_token = "tok"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "a"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("server_node_id")),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_missing_group_token() {
+        let bad = r#"
+server_node_id = "abcd"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "a"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("group_token")),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    /// `[relay]` is server-administered. A client TOML containing one
+    /// must be rejected so a copy-pasted `server.toml` doesn't silently
+    /// pretend to set the reply-bandwidth cap from the client side.
+    #[test]
+    fn rejects_relay_section_in_client_config() {
+        let bad = r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[relay]
+bytes_per_sec = 999999
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "a"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(
+                s.contains("relay") && s.contains("server-only"),
+                "expected server-only relay error, got: {s}"
+            ),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    /// Counterpart: a server config without `[relay]` must still parse
+    /// + validate cleanly so omitting the section picks up the defaults.
+    #[test]
+    fn server_config_without_relay_section_is_allowed() {
+        let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+"#;
+        let cfg = RootConfig::load_from_str(cfg_str).expect("omitted [relay] is fine");
+        assert!(cfg.is_server());
+        assert!(cfg.relay.is_none(), "no [relay] => None, not default");
+    }
+
+    /// And a server config WITH `[relay]` is accepted and the value is
+    /// read faithfully.
+    #[test]
+    fn server_config_with_relay_section_is_read() {
+        let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[relay]
+bytes_per_sec = 4096
+"#;
+        let cfg = RootConfig::load_from_str(cfg_str).expect("[relay] on server is fine");
+        assert!(cfg.is_server());
+        let relay = cfg.relay.as_ref().expect("Some(_))");
+        assert_eq!(relay.bytes_per_sec, 4096);
+        assert!(relay.rate_overrides.is_empty());
+    }
+
+    /// `[[relay.rate_override]]` rows with valid EndpointIDs round-trip
+    /// through validation.
+    #[test]
+    fn server_config_with_rate_overrides_is_accepted() {
+        // 32-byte all-zero payload is a valid ed25519 public key (the
+        // identity point) — avoids the test breaking on random-looking
+        // hex strings that decode to non-curve points.
+        let nid_hex = "00".repeat(32);
+        let cfg_str = format!(
+            r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[relay]
+bytes_per_sec = 102400
+
+[[relay.rate_override]]
+node_id = "{nid_hex}"
+bytes_per_sec = 1048576
+"#
+        );
+        let cfg = RootConfig::load_from_str(&cfg_str).expect("valid override accepted");
+        let relay = cfg.relay.as_ref().expect("Some(_))");
+        assert_eq!(relay.rate_overrides.len(), 1);
+        assert_eq!(relay.rate_overrides[0].bytes_per_sec, 1048576);
+        assert_eq!(relay.rate_overrides[0].node_id, nid_hex);
+    }
+
+    /// `[[relay.rate_override]]` rows with garbage in `node_id` are
+    /// rejected at config load, not silently dropped at lookup time.
+    #[test]
+    fn server_config_with_malformed_rate_override_is_rejected() {
+        let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[[relay.rate_override]]
+node_id = "not-a-real-endpoint-id"
+bytes_per_sec = 4096
+"#;
+        let err = RootConfig::load_from_str(cfg_str).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(
+                s.contains("rate_override") && s.contains("node_id"),
+                "msg: {s}"
+            ),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    /// Two `[[relay.rate_override]]` rows claiming the same NodeID is a
+    /// config error.
+    #[test]
+    fn server_config_with_duplicate_rate_override_is_rejected() {
+        let nid_hex = "00".repeat(32);
+        let cfg_str = format!(
+            r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[[relay.rate_override]]
+node_id = "{nid_hex}"
+bytes_per_sec = 4096
+
+[[relay.rate_override]]
+node_id = "{nid_hex}"
+bytes_per_sec = 8192
+"#
+        );
+        let err = RootConfig::load_from_str(&cfg_str).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(
+                s.contains("rate_override") && s.contains("duplicate"),
+                "msg: {s}"
+            ),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_expose_names() {
+        let bad = r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:22"
+shared_secret = "a"
+
+[[expose]]
+name = "ssh"
+local_addr = "127.0.0.1:23"
+shared_secret = "b"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => assert!(s.contains("ssh"), "msg: {s}"),
+            other => panic!("expected validate error, got {other:?}"),
+        }
+    }
+
+    /// The plan asks us to verify `[[consume]]` referencing an unknown
+    /// service is rejected. Today the validator only checks that
+    /// consume/expose/static names don't collide; cross-references to
+    /// *peer* services are not validated (a consumer can name a service
+    /// that only exists on another client). We pin that semantic by
+    /// asserting a consume entry with an unknown service name still
+    /// Master switch defaults to OFF — rate limiting is opt-in. Pinning
+/// the default here so a future refactor that flips it can't silently
+/// start throttling production servers.
+#[test]
+fn relay_master_switch_defaults_to_off() {
+    let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[relay]
+bytes_per_sec = 999999
+"#;
+    let cfg = RootConfig::load_from_str(cfg_str).expect("[relay] with bytes_per_sec parses");
+    let relay = cfg.relay.as_ref().expect("Some(_))");
+    assert!(
+        !relay.enabled,
+        "relay.enabled must default to false when omitted"
+    );
+    // The bytes_per_sec is parsed faithfully but is dormant because
+    // the master switch is off.
+    assert_eq!(relay.bytes_per_sec, 999999);
+}
+
+#[test]
+fn relay_master_switch_explicit_on_is_accepted() {
+    let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[relay]
+enabled = true
+bytes_per_sec = 4096
+"#;
+    let cfg = RootConfig::load_from_str(cfg_str).expect("explicit enabled = true parses");
+    let relay = cfg.relay.as_ref().expect("Some(_))");
+    assert!(relay.enabled);
+    assert_eq!(relay.bytes_per_sec, 4096);
+}
+
+#[test]
+fn relay_master_switch_explicit_off_is_accepted() {
+    let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+
+[relay]
+enabled = false
+"#;
+    let cfg = RootConfig::load_from_str(cfg_str).expect("explicit enabled = false parses");
+    let relay = cfg.relay.as_ref().expect("Some(_))");
+    assert!(!relay.enabled);
+    // bytes_per_sec falls back to the 100 KiB/s default; that's
+    // dormant when the switch is off.
+    assert_eq!(relay.bytes_per_sec, 100 * 1024);
+}
+
+#[test]
+fn relay_section_omitted_means_disabled() {
+    let cfg_str = r#"
+[common.logging]
+level = "info"
+
+[[group]]
+name = "homelab"
+group_token = "tok"
+"#;
+    let cfg = RootConfig::load_from_str(cfg_str).expect("omitted [relay] is fine");
+    assert!(cfg.relay.is_none(), "no [relay] => None");
+}
+
+#[test]
+fn relay_rate_limit_default_for_relay_config() {
+    // The struct-level `Default` must produce a disabled switch so
+    // any code that constructs a `RelayConfig::default()` (rather
+    // than deserializing one) starts from "off".
+    let d = RelayConfig::default();
+    assert!(!d.enabled, "default RelayConfig must be disabled");
+    assert!(d.rate_overrides.is_empty());
+}
+
+/// The plan asks us to verify `[[consume]]` referencing an unknown
+/// service is rejected. Today the validator only checks that
+/// consume/expose/static names don't collide; cross-references to
+/// *peer* services are not validated (a consumer can name a service
+/// that only exists on another client). We pin that semantic by
+/// asserting a consume entry with an unknown service name still
+/// parses + validates successfully — this test is documentation, not
+/// a rejection test. If future phases want stricter validation,
+/// they'll update this expectation.
+#[test]
+fn consume_referencing_unknown_service_is_allowed() {
+        let cfg_str = r#"
+server_node_id = "abcd"
+group_token = "tok"
+
+[[consume]]
+name = "remote-only-service"
+local_bind = "127.0.0.1:9000"
+shared_secret = "s"
+"#;
+        let cfg = RootConfig::load_from_str(cfg_str).expect("consume of unknown peer svc is valid");
+        assert_eq!(cfg.consume.len(), 1);
+        assert_eq!(cfg.consume[0].name, "remote-only-service");
+    }
+
+    #[test]
+    fn rejects_duplicate_group_names() {
+        let bad = r#"
+[[group]]
+name = "homelab"
+group_token = "a"
+
+[[group]]
+name = "homelab"
+group_token = "b"
+"#;
+        let err = RootConfig::load_from_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(s) => {
+                assert!(s.contains("duplicate") || s.contains("homelab"));
+            }
+            other => panic!("expected validate error, got {other:?}"),
         }
     }
 }

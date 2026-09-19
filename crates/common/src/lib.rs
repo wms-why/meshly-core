@@ -6,14 +6,16 @@
 
 pub mod alpn;
 pub mod config;
+pub mod endpoint;
 pub mod identity;
 pub mod protocol;
 pub mod tunnel;
 
 pub use alpn::{alpn_control, alpn_data, alpn_for_service, validate_service_name, AlpnError};
+pub use endpoint::parse_endpoint_id;
 pub use config::{
     ClientConfig, CommonConfig, ConsumeConfig, ExposeConfig, GroupConfig, LoggingConfig,
-    ReconnectConfig, ServerConfig, RootConfig,
+    ReconnectConfig, RootConfig, ServerConfig,
 };
 pub use identity::{load_or_generate, load_or_generate_at, IdentityPaths};
 pub use protocol::{

@@ -15,3 +15,35 @@ group_token = "long-random-string-shared-with-clients"
 [heartbeat]
 interval_secs = 60
 timeout_secs  = 600
+
+# Relay-plane tuning.
+#
+# `enabled` is the master switch. `false` (the default) bypasses the
+# rate limiter entirely: the relay forwards all reply bytes as fast as
+# QUIC allows. `true` engages the limiter using `bytes_per_sec` as the
+# default cap, with `rate_override` rows taking precedence for
+# specific consumers.
+#
+# When the master switch is on, the relay handler reads `bytes_per_sec`
+# (default 100 KiB/s) as the per-connection cap and looks up any
+# matching `[[relay.rate_override]]` row by consumer NodeID. Per-
+# connection limits can also be adjusted at runtime via the rate-handle
+# registry held by ServerState (see crates/server/src/registry.rs).
+#
+# `[[relay.rate_override]]` rows identify a consumer by its EndpointID
+# (canonical z-base32 or 64-char hex). The server reads the consumer's
+# NodeID from the DataOpen frame and checks it against the QUIC
+# connection peer before applying it — a mismatched claim is rejected.
+[relay]
+enabled       = false       # master switch; OFF by default
+bytes_per_sec = 102400      # 100 KiB/s default when enabled
+
+# Example overrides (commented out):
+# [[relay.rate_override]]
+# node_id       = "abcdef...zbase32-or-64-hex-chars..."
+# bytes_per_sec = 1048576  # 1 MiB/s for this consumer
+#
+# [[relay.rate_override]]
+# node_id       = "0123456789abcdef..."
+# bytes_per_sec = 0         # unlimited for VIP consumers (only effective
+#                            # when the master switch is on)

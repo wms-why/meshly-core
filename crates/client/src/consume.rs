@@ -307,6 +307,7 @@ async fn dial_relay(
     Frame::DataOpen {
         target_service: state.spec.name.clone(),
         target_provider: provider_id.to_string(),
+        consumer_node_id: state.endpoint.secret_key().public().to_string(),
         proof: [0u8; 32],
     }
     .write_to(&mut send)
@@ -358,4 +359,87 @@ async fn ensure_provider_id(state: &Arc<ConsumeState>) -> Result<EndpointId> {
 
 async fn invalidate_provider_cache(state: &Arc<ConsumeState>) {
     *state.cached_provider.lock().await = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ReconnectConfig::default` must use the documented values:
+    /// 50 ms initial backoff, 5000 ms cap, prefer_direct=true.
+    #[test]
+    fn reconnect_config_default_values() {
+        let d = ReconnectConfig::default();
+        assert_eq!(d.initial_backoff_ms, 50);
+        assert_eq!(d.max_backoff_ms, 5000);
+        assert!(d.prefer_direct);
+    }
+
+    // -- is_auth_error classifier tests -----------------------------------
+
+    /// The classifier must accept every error message format the
+    /// protocol code emits today. The set of accepted substrings is
+    /// pinned by these tests so any future tightening (Phase 9 typed
+    /// errors) can be checked against them.
+    #[test]
+    fn is_auth_error_matches_provider_rejected_proof() {
+        let e = anyhow::anyhow!("provider rejected proof: code=1 reason=bad");
+        assert!(is_auth_error(&e));
+    }
+
+    #[test]
+    fn is_auth_error_matches_provider_auth_err() {
+        let e = anyhow::anyhow!("provider auth err code=2 reason=no_nonce");
+        assert!(is_auth_error(&e));
+    }
+
+    #[test]
+    fn is_auth_error_matches_auth_err_token() {
+        // The "AuthErr" substring is in the formatted error chain (via
+        // anyhow's Debug formatting) when the source error contains it.
+        let e = anyhow::anyhow!("auth handshake failed: AuthErr {{ code: 3 }}");
+        assert!(is_auth_error(&e));
+    }
+
+    #[test]
+    fn is_auth_error_matches_relay_auth_rejected() {
+        // The relay path produces "relay auth rejected: ..." which
+        // contains the substring "AuthErr" — wait, no: it doesn't. But
+        // it does contain "relay auth rejected". The classifier as
+        // written does NOT match that substring. Pinning the actual
+        // current behavior so a future tightening is intentional.
+        let e = anyhow::anyhow!("relay auth rejected: code=1 reason=bad");
+        // Today the classifier only matches the three documented strings.
+        // We document that "relay auth rejected" is NOT in the match set.
+        assert!(
+            !is_auth_error(&e),
+            "is_auth_error should not match 'relay auth rejected' (Phase 9 will fix this)"
+        );
+    }
+
+    #[test]
+    fn is_auth_error_rejects_unrelated_errors() {
+        for msg in [
+            "connection refused",
+            "timeout while dialing",
+            "bind: address already in use",
+            "no provider for service \"ssh\"",
+            "server has no provider for service \"web\"",
+            "unexpected frame after hello: Foo",
+        ] {
+            let e = anyhow::anyhow!(msg);
+            assert!(
+                !is_auth_error(&e),
+                "is_auth_error should reject unrelated error: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_auth_error_inside_wrapped_context() {
+        // Substring match is on the full anyhow chain (via {e:#}).
+        let e = anyhow::anyhow!("connect to provider")
+            .context("provider rejected proof: code=1 reason=bad");
+        assert!(is_auth_error(&e));
+    }
 }

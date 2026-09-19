@@ -1,6 +1,7 @@
 //! meshly-core-server entry point.
 
 mod control;
+mod ratelimit;
 mod relay;
 mod registry;
 
@@ -67,7 +68,40 @@ async fn real_main() -> Result<()> {
         registry::load_identity(cfg.common.identity_path.as_deref())?;
 
     // Server state.
-    let state = registry::ServerState::new(&cfg.groups);
+    // Parse [[relay.rate_override]] rows into (EndpointId, u64) so the
+    // registry can serve them with O(1) lookup at tunnel-open time.
+    // Anything that failed to parse at validate_server should already
+    // have been rejected; we silently skip rows that didn't survive
+    // serde round-trip for any reason, to avoid crashing startup.
+    let rate_overrides: Vec<(iroh::EndpointId, u64)> = cfg
+        .relay
+        .as_ref()
+        .map(|r| {
+            r.rate_overrides
+                .iter()
+                .filter_map(|o| meshly_core_common::parse_endpoint_id(&o.node_id).map(|id| (id, o.bytes_per_sec)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let state = registry::ServerState::new(&cfg.groups, &rate_overrides);
+
+    // Master switch. When off, the relay handler receives `None` and
+    // skips rate-handle allocation entirely; relay tasks byte-bridge
+    // both directions as fast as QUIC allows.
+    let relay_enabled = cfg.relay.as_ref().map(|r| r.enabled).unwrap_or(false);
+    let default_reply_bps = if relay_enabled {
+        let default_bps = cfg.relay.as_ref().map(|r| r.bytes_per_sec).unwrap_or(100 * 1024);
+        info!(
+            relay_enabled = true,
+            default_reply_bps = default_bps,
+            relay_overrides = rate_overrides.len(),
+            "relay: rate limiting ENABLED"
+        );
+        Some(ratelimit::new_handle(default_bps))
+    } else {
+        info!("relay: rate limiting DISABLED at master switch");
+        None
+    };
 
     if cli.status {
         print_status(&state, &node_id);
@@ -94,6 +128,7 @@ async fn real_main() -> Result<()> {
         .accept(alpn_data(), relay::RelayHandler {
             endpoint: endpoint.clone(),
             state: state.clone(),
+            default_reply_bps,
         })
         .spawn();
 
@@ -156,6 +191,18 @@ fn print_status(state: &registry::ServerState, node_id: &str) {
                 "group": g,
                 "service": s,
                 "provider": p.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "relay_streams": state.relay_rates_snapshot().into_iter()
+            .map(|(id, bps)| serde_json::json!({
+                "stream_id": id,
+                "reply_bytes_per_sec": bps,
+            }))
+            .collect::<Vec<_>>(),
+        "relay_rate_overrides": state.relay_rate_overrides_snapshot().into_iter()
+            .map(|(id, bps)| serde_json::json!({
+                "consumer": id.to_string(),
+                "reply_bytes_per_sec": bps,
             }))
             .collect::<Vec<_>>(),
     });

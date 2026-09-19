@@ -5,8 +5,14 @@
 //! `services` so that per-group lookups can proceed in parallel without
 //! blocking the global lock. The lock is only held for HashMap lookups
 //! and DashMap references; once handed out, no global lock is involved.
+//!
+//! Active relay streams register their rate-limit handles in the
+//! `relay_rates` DashMap under a unique `stream_id`. This is the hook
+//! future control-plane handlers will use to adjust the bandwidth cap
+//! of an individual connection without restarting it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -17,6 +23,17 @@ use iroh::{EndpointId, SecretKey};
 #[derive(Debug)]
 pub struct ServerState {
     inner: RwLock<ServerStateInner>,
+    /// Monotonic counter for relay stream ids. Stable for the lifetime
+    /// of the server process; never reused.
+    next_stream_id: AtomicU64,
+    /// Active relay streams, keyed by `stream_id`. The value is the
+    /// `Arc<AtomicU64>` rate handle the writer reads each refill.
+    relay_rates: DashMap<u64, Arc<AtomicU64>>,
+    /// Per-consumer reply-rate overrides from the server config. Looked
+    /// up by the consumer's EndpointID when a new relay tunnel opens;
+    /// consumers not listed fall back to the global default. `0` in
+    /// the value means "unlimited for this consumer".
+    relay_rate_overrides: HashMap<EndpointId, u64>,
 }
 
 struct ServerStateInner {
@@ -51,8 +68,16 @@ pub struct ServiceRecord {
 }
 
 impl ServerState {
-    /// Build a fresh registry from the configured group definitions.
-    pub fn new(groups: &[meshly_core_common::config::GroupConfig]) -> Arc<Self> {
+    /// Build a fresh registry from the configured group definitions
+    /// and the per-consumer rate overrides parsed out of the relay
+    /// config. `rate_overrides` is a list of
+    /// `(EndpointId, bytes_per_sec)`; entries with an unparseable
+    /// `node_id` are skipped (the config validator should have caught
+    /// those at load time).
+    pub fn new(
+        groups: &[meshly_core_common::config::GroupConfig],
+        rate_overrides: &[(EndpointId, u64)],
+    ) -> Arc<Self> {
         let mut map = HashMap::with_capacity(groups.len());
         for g in groups {
             map.insert(
@@ -69,8 +94,15 @@ impl ServerState {
             !map.is_empty(),
             "server must have at least one group configured"
         );
+        let mut overrides = HashMap::with_capacity(rate_overrides.len());
+        for (id, bps) in rate_overrides {
+            overrides.insert(*id, *bps);
+        }
         Arc::new(Self {
             inner: RwLock::new(ServerStateInner { groups: map }),
+            next_stream_id: AtomicU64::new(1),
+            relay_rates: DashMap::new(),
+            relay_rate_overrides: overrides,
         })
     }
 
@@ -114,6 +146,72 @@ impl ServerState {
             .read()
             .map(|i| i.groups.values().map(|g| g.sessions.len()).sum())
             .unwrap_or(0)
+    }
+
+    /// Per-consumer reply-rate override, if one was configured for
+    /// this consumer's NodeID. Returns `None` if no override is set;
+    /// the caller should fall back to its default.
+    ///
+    /// The returned `u64` is bytes per second. `0` means unlimited
+    /// for this specific consumer.
+    pub fn lookup_relay_rate_override(&self, consumer: EndpointId) -> Option<u64> {
+        self.relay_rate_overrides.get(&consumer).copied()
+    }
+
+    /// Snapshot of every per-consumer rate override, as
+    /// `(EndpointId, bytes_per_sec)`. Useful for `--status`.
+    pub fn relay_rate_overrides_snapshot(&self) -> Vec<(EndpointId, u64)> {
+        self.relay_rate_overrides
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
+    // -------------------------------------------------------------------
+    // Relay-stream bookkeeping (the "dynamic per-connection rate" hook)
+    // -------------------------------------------------------------------
+
+    /// Allocate a fresh `stream_id` for a new relay task. Ids are
+    /// monotonic and never reused within a process lifetime.
+    pub fn alloc_stream_id(&self) -> u64 {
+        self.next_stream_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register a relay task's rate handle under `stream_id`. The
+    /// handle is what a future control-plane message will mutate to
+    /// adjust this connection's bandwidth cap at runtime.
+    pub fn register_relay_rate(&self, stream_id: u64, handle: Arc<AtomicU64>) {
+        self.relay_rates.insert(stream_id, handle);
+    }
+
+    /// Remove a relay's rate handle when the task ends. Idempotent.
+    pub fn unregister_relay_rate(&self, stream_id: u64) {
+        self.relay_rates.remove(&stream_id);
+    }
+
+    /// Dynamically update the reply bandwidth cap of a single relay
+    /// connection. Returns `true` if `stream_id` was found and updated.
+    ///
+    /// This is the hook future admin / control-plane messages will use.
+    /// `0` disables throttling for that connection; any positive value
+    /// caps the reply stream at that many bytes per second.
+    #[allow(dead_code)] // exposed for the forthcoming control-plane admin path
+    pub fn update_relay_rate(&self, stream_id: u64, bytes_per_sec: u64) -> bool {
+        if let Some(h) = self.relay_rates.get(&stream_id) {
+            h.store(bytes_per_sec, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot of `(stream_id, current_bps)` for every active relay.
+    /// Useful for `--status` style introspection.
+    pub fn relay_rates_snapshot(&self) -> Vec<(u64, u64)> {
+        self.relay_rates
+            .iter()
+            .map(|e| (*e.key(), e.value().load(Ordering::Relaxed)))
+            .collect()
     }
 }
 
