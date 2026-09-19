@@ -25,11 +25,11 @@ use tracing::{debug, info, warn};
 use meshly_core_common::alpn::alpn_for_service;
 use meshly_core_common::protocol::{
     AuthNonce, AuthOk, AuthProof, AuthErr, Frame, Hello, HelloOk, Subscribe, SubscribeOk,
-    AUTH_ERR_BAD_PROOF,
 };
 use meshly_core_common::tunnel::{bridge, BiStream};
 
 use crate::expose::make_proof;
+use crate::status::{ConsumerState, RuntimeStatus};
 
 /// Description of one remote service to consume.
 #[derive(Debug, Clone)]
@@ -46,8 +46,9 @@ pub struct ConsumeState {
     pub server_node_id: EndpointId,
     pub group_token: String,
     pub endpoint: Endpoint,
-    pub conn: Mutex<Option<Connection>>,
+    pub cached_provider: Mutex<Option<EndpointId>>,
     pub reconnect: ReconnectConfig,
+    pub status: Arc<RuntimeStatus>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,9 +160,10 @@ pub async fn run(state: Arc<ConsumeState>) -> Result<()> {
 }
 
 async fn forward_one(state: Arc<ConsumeState>, tcp: tokio::net::TcpStream) -> Result<()> {
-    let conn = acquire_or_dial(&state).await?;
-    let (send, recv) = conn.open_bi().await?;
+    let (conn, send, recv) = dial_stream(&state).await?;
     let service_name = state.spec.name.clone();
+    // Keep the underlying Connection alive for the lifetime of `bridge`.
+    let _keepalive = conn;
     let copied = bridge(tcp, BiStream::new(recv, send)).await?;
     debug!(
         service = %service_name,
@@ -171,28 +173,65 @@ async fn forward_one(state: Arc<ConsumeState>, tcp: tokio::net::TcpStream) -> Re
     Ok(())
 }
 
-async fn acquire_or_dial(state: &Arc<ConsumeState>) -> Result<Connection> {
-    {
-        let guard = state.conn.lock().await;
-        if let Some(c) = guard.as_ref()
-            && c.close_reason().is_none()
-        {
-            return Ok(c.clone());
-        }
-    }
-    // Dial with retry + backoff. We resolve the provider id lazily on
-    // first dial so the user's Subscribe call is the source of truth.
+/// Dial a stream that is ready to bridge to a local TCP connection.
+///
+/// Returns the underlying `Connection` (so the caller can hold it
+/// alive for the duration of `bridge`), plus the bi-directional
+/// `SendStream` / `RecvStream` that have already been authenticated
+/// (direct path) or have already presented `DataOpen` (relay path).
+/// The caller can therefore pass the streams straight into `bridge`.
+///
+/// Retries with exponential backoff on transient failure. The cached
+/// provider EndpointId is refreshed if direct auth fails (likely
+/// because the provider restarted under a new identity).
+async fn dial_stream(
+    state: &Arc<ConsumeState>,
+) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    let name = state.spec.name.clone();
+    state
+        .status
+        .set_consumer_state(&name, ConsumerState::Dialing, None, None)
+        .await;
     let mut backoff_ms = state.reconnect.initial_backoff_ms;
     loop {
-        match dial_provider(state).await {
-            Ok(c) => {
-                let mut guard = state.conn.lock().await;
-                *guard = Some(c.clone());
-                return Ok(c);
+        let provider_id = ensure_provider_id(state).await?;
+        if state.reconnect.prefer_direct {
+            match dial_direct(state, provider_id).await {
+                Ok(x) => {
+                    state
+                        .status
+                        .set_consumer_state(&name, ConsumerState::Live, Some("direct"), None)
+                        .await;
+                    return Ok(x);
+                }
+                Err(e) => {
+                    warn!(service = %state.spec.name, err = %e,
+                        "direct P2P failed; falling back to server relay");
+                    // If direct failed with an auth error, the cached
+                    // provider id is stale; force a fresh subscribe on
+                    // the next attempt.
+                    if is_auth_error(&e) {
+                        invalidate_provider_cache(state).await;
+                    }
+                }
+            }
+        }
+        match dial_relay(state, provider_id).await {
+            Ok(x) => {
+                state
+                    .status
+                    .set_consumer_state(&name, ConsumerState::Live, Some("relay"), None)
+                    .await;
+                return Ok(x);
             }
             Err(e) => {
                 warn!(service = %state.spec.name, err = %e,
-                    backoff_ms, "dial provider failed; retrying");
+                    backoff_ms, "relay dial failed; retrying");
+                let msg = format!("{e:#}");
+                state
+                    .status
+                    .set_consumer_state(&name, ConsumerState::Failed, None, Some(&msg))
+                    .await;
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(state.reconnect.max_backoff_ms);
             }
@@ -200,99 +239,123 @@ async fn acquire_or_dial(state: &Arc<ConsumeState>) -> Result<Connection> {
     }
 }
 
-async fn dial_provider(state: &Arc<ConsumeState>) -> Result<Connection> {
-    // Resolve provider id (cached via subscribe? For v1 we re-subscribe
-    // each time after a dial failure to refresh the id in case the
-    // provider restarted).
-    let provider_id = subscribe(
+/// Best-effort classification: is this error a provider auth failure
+/// (bad proof / wrong service), which strongly suggests the cached
+/// provider id is stale?
+fn is_auth_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("provider rejected proof")
+        || msg.contains("provider auth err")
+        || msg.contains("AuthErr")
+}
+
+async fn dial_direct(
+    state: &Arc<ConsumeState>,
+    provider_id: EndpointId,
+) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    let service_name = state.spec.name.clone();
+    let shared_secret = state.spec.shared_secret.clone();
+    let alpn = alpn_for_service(&service_name)?;
+
+    let conn = state
+        .endpoint
+        .connect(EndpointAddr::new(provider_id), &alpn)
+        .await
+        .context("connect to provider")?;
+    // Run the HMAC handshake on the same bi-stream we will bridge, so
+    // we do not need a second stream and do not leak an unauthenticated
+    // one into the provider's handler.
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let nonce_frame = Frame::read_from(&mut recv).await?;
+    let nonce = match nonce_frame {
+        Frame::AuthNonce(AuthNonce { nonce }) => nonce,
+        Frame::AuthErr(AuthErr { code, reason }) => {
+            return Err(anyhow!("provider auth err code={code} reason={reason}"));
+        }
+        other => return Err(anyhow!("expected AuthNonce, got {other:?}")),
+    };
+    let proof = make_proof(&shared_secret, &service_name, &nonce);
+    Frame::AuthProof(AuthProof { mac: proof })
+        .write_to(&mut send)
+        .await?;
+    match Frame::read_from(&mut recv).await? {
+        Frame::AuthOk(AuthOk) => {
+            debug!(service = %service_name, "direct auth ok");
+            Ok((conn, send, recv))
+        }
+        Frame::AuthErr(AuthErr { code, reason }) => {
+            Err(anyhow!("provider rejected proof: code={code} reason={reason}"))
+        }
+        other => Err(anyhow!("expected AuthOk, got {other:?}")),
+    }
+}
+
+async fn dial_relay(
+    state: &Arc<ConsumeState>,
+    provider_id: EndpointId,
+) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    let conn = state
+        .endpoint
+        .connect(EndpointAddr::new(state.server_node_id), b"meshly-core/data")
+        .await
+        .context("connect to server relay")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    // 1. Routing metadata so the server's relay handler knows where to
+    //    dial. The `proof` field is a placeholder for v2 server-side
+    //    verification; today the server does not have the shared_secret
+    //    and forwards bytes transparently.
+    Frame::DataOpen {
+        target_service: state.spec.name.clone(),
+        target_provider: provider_id.to_string(),
+        proof: [0u8; 32],
+    }
+    .write_to(&mut send)
+    .await?;
+    // 2. The provider runs an HMAC handshake on the first bi-stream it
+    //    accepts. The server's relay handler byte-bridges the two
+    //    streams, so the AuthNonce / AuthProof / AuthOk frames flow
+    //    transparently through it. We perform the same handshake the
+    //    direct path uses, on the same stream we will then bridge.
+    let nonce_frame = Frame::read_from(&mut recv).await?;
+    let nonce = match nonce_frame {
+        Frame::AuthNonce(AuthNonce { nonce }) => nonce,
+        Frame::AuthErr(AuthErr { code, reason }) => {
+            return Err(anyhow!("relay auth err code={code} reason={reason}"));
+        }
+        other => return Err(anyhow!("expected AuthNonce from relay, got {other:?}")),
+    };
+    let proof = make_proof(&state.spec.shared_secret, &state.spec.name, &nonce);
+    Frame::AuthProof(AuthProof { mac: proof })
+        .write_to(&mut send)
+        .await?;
+    match Frame::read_from(&mut recv).await? {
+        Frame::AuthOk(AuthOk) => {
+            debug!(service = %state.spec.name, "relay auth ok");
+            Ok((conn, send, recv))
+        }
+        Frame::AuthErr(AuthErr { code, reason }) => {
+            Err(anyhow!("relay auth rejected: code={code} reason={reason}"))
+        }
+        other => Err(anyhow!("expected AuthOk from relay, got {other:?}")),
+    }
+}
+
+/// Return the cached provider EndpointId, or subscribe to discover it.
+async fn ensure_provider_id(state: &Arc<ConsumeState>) -> Result<EndpointId> {
+    if let Some(id) = *state.cached_provider.lock().await {
+        return Ok(id);
+    }
+    let id = subscribe(
         &state.endpoint,
         state.server_node_id,
         &state.group_token,
         &state.spec.name,
     )
     .await?;
-
-    let alpn = alpn_for_service(&state.spec.name)?;
-    // Try direct first if prefer_direct.
-    let direct_result = if state.reconnect.prefer_direct {
-        let service_name = state.spec.name.clone();
-        let shared_secret = state.spec.shared_secret.clone();
-        let r: Result<Connection> = async {
-            let conn = state
-                .endpoint
-                .connect(EndpointAddr::new(provider_id), &alpn)
-                .await?;
-            // Authenticate.
-            let (mut send, mut recv) = conn.open_bi().await?;
-            let nonce_frame = Frame::read_from(&mut recv).await?;
-            let nonce = match nonce_frame {
-                Frame::AuthNonce(AuthNonce { nonce }) => nonce,
-                Frame::AuthErr(AuthErr { code, reason }) => {
-                    return Err(anyhow!("provider auth err code={code} reason={reason}"));
-                }
-                _ => return Err(anyhow!("expected AuthNonce, got {nonce_frame:?}")),
-            };
-            let proof = make_proof(&shared_secret, &service_name, &nonce);
-            Frame::AuthProof(AuthProof { mac: proof })
-                .write_to(&mut send)
-                .await?;
-            let auth_resp = Frame::read_from(&mut recv).await?;
-            match auth_resp {
-                Frame::AuthOk(AuthOk) => {
-                    debug!(service = %service_name, "direct auth ok");
-                    drop(send);
-                    drop(recv);
-                    Ok(conn)
-                }
-                Frame::AuthErr(AuthErr { code, reason }) => {
-                    Err(anyhow!("provider rejected proof: code={code} reason={reason}"))
-                }
-                _ => Err(anyhow!("expected AuthOk, got {auth_resp:?}")),
-            }
-        }
-        .await;
-        Some(r)
-    } else {
-        None
-    };
-
-    match direct_result {
-        Some(Ok(c)) => Ok(c),
-        Some(Err(e)) => {
-            warn!(service = %state.spec.name, err = %e,
-                "direct P2P failed; falling back to server relay");
-            dial_via_relay(state, provider_id).await
-        }
-        None => dial_via_relay(state, provider_id).await,
-    }
+    *state.cached_provider.lock().await = Some(id);
+    Ok(id)
 }
 
-async fn dial_via_relay(state: &Arc<ConsumeState>, provider_id: EndpointId) -> Result<Connection> {
-    // Connect to server on meshly-core/data ALPN. We open a fresh connection per
-    // forwarded stream (the server's relay handler expects this).
-    let conn = state
-        .endpoint
-        .connect(EndpointAddr::new(state.server_node_id), b"meshly-core/data")
-        .await?;
-    let (mut send, recv) = conn.open_bi().await?;
-    let svc = state.spec.name.clone();
-    Frame::DataOpen {
-        target_service: svc,
-        target_provider: provider_id.to_string(),
-        proof: [0u8; 32],
-    }
-    .write_to(&mut send)
-    .await?;
-    // Drop our local handle on the negotiation stream; the relay task will
-    // open its own provider-side stream.
-    drop(send);
-    drop(recv);
-    Ok(conn)
-}
-
-// Suppress dead-code warning for the imported proof helper used above.
-#[allow(dead_code)]
-fn _unused() -> Result<()> {
-    let _ = AUTH_ERR_BAD_PROOF;
-    Ok(())
+async fn invalidate_provider_cache(state: &Arc<ConsumeState>) {
+    *state.cached_provider.lock().await = None;
 }

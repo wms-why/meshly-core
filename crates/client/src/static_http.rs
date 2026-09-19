@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
 use meshly_core_common::protocol::{
@@ -94,6 +94,10 @@ impl StaticHandler {
         // 2. Serve HTTP requests on this bi-stream until the peer closes.
         //    HTTP/1.1 keeps the connection open by default; we loop serving
         //    requests until EOF.
+        // Wrap the recv half in a BufReader so the per-byte parser
+        // amortises syscalls: each `fill_buf` returns whatever is
+        // already buffered, and `consume` advances without losing data.
+        let mut recv = BufReader::new(recv);
         loop {
             match serve_one(&self.spec, &mut send, &mut recv).await {
                 Ok(true) => continue,    // served successfully, keep going
@@ -119,7 +123,7 @@ impl StaticHandler {
 async fn serve_one<W, R>(spec: &StaticSpec, send: &mut W, recv: &mut R) -> Result<bool>
 where
     W: AsyncWriteExt + Unpin,
-    R: AsyncReadExt + Unpin,
+    R: AsyncBufReadExt + Unpin,
 {
     let req = match read_request(recv).await? {
         Some(r) => r,
@@ -130,7 +134,7 @@ where
 
     let response = match build_response(spec, &req) {
         Ok(r) => r,
-        Err(status) => error_response(status, &req.method),
+        Err(status) => error_response(status, &req.method, req.keep_alive),
     };
     write_response(send, &response).await?;
     Ok(req.keep_alive)
@@ -148,37 +152,22 @@ const MAX_BODY_BYTES: usize = 0; // we don't accept request bodies (GET/HEAD onl
 struct Request {
     method: String,
     path: String,
-    /// Set to true for HTTP/1.1 default behaviour. The peer can opt out
-    /// with `Connection: close`.
+    /// Whether to keep the connection open after this response. The
+    /// rules: HTTP/1.1 defaults to keep-alive (peer can opt out with
+    /// `Connection: close`); HTTP/1.0 defaults to close (peer can opt
+    /// in with `Connection: keep-alive`).
     keep_alive: bool,
 }
 
-async fn read_request<R: AsyncReadExt + Unpin>(recv: &mut R) -> Result<Option<Request>> {
-    // Request line: "METHOD SP PATH SP HTTP/x.y CRLF"
-    let mut buf = Vec::with_capacity(512);
-    let mut newline_count = 0usize;
-    while buf.len() < MAX_REQUEST_LINE {
-        let mut byte = [0u8; 1];
-        let n = recv.read(&mut byte).await?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            return Err(anyhow!("static: peer closed mid-request-line"));
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'\n' {
-            newline_count += 1;
-            if newline_count == 1 {
-                // request line ended
-                break;
-            }
-        }
-    }
-    if buf.last().copied() != Some(b'\n') {
-        return Err(anyhow!("static: request line exceeded {MAX_REQUEST_LINE} bytes"));
-    }
-    let request_line = std::str::from_utf8(&buf)
+async fn read_request<R: AsyncBufReadExt + Unpin>(recv: &mut R) -> Result<Option<Request>> {
+    // Request line: "METHOD SP PATH SP HTTP/x.y CRLF". Read up to the
+    // first `\n` with a hard size cap so a malicious peer cannot make us
+    // buffer an unbounded amount before we error out.
+    let line_buf = match read_until_limited(recv, b'\n', MAX_REQUEST_LINE).await? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let request_line = std::str::from_utf8(&line_buf)
         .with_context(|| "static: non-UTF-8 request line")?
         .trim_end_matches(['\r', '\n']);
     let mut parts = request_line.split(' ');
@@ -198,25 +187,16 @@ async fn read_request<R: AsyncReadExt + Unpin>(recv: &mut R) -> Result<Option<Re
     }
 
     // Headers: read until \r\n\r\n (we tolerate \n\n too).
-    let mut header_buf = Vec::with_capacity(256);
-    let mut total = 0usize;
-    while total < MAX_HEADERS {
-        let mut byte = [0u8; 1];
-        let n = recv.read(&mut byte).await?;
-        if n == 0 {
-            return Err(anyhow!("static: peer closed mid-headers"));
-        }
-        header_buf.push(byte[0]);
-        total += 1;
-        if header_buf.ends_with(b"\r\n\r\n") || header_buf.ends_with(b"\n\n") {
-            break;
-        }
-    }
+    // Headers: read up to the `\r\n\r\n` terminator (we also accept the
+    // bare `\n\n` form). Bounded so a runaway client gets a clean error
+    // instead of an OOM.
+    let header_buf = read_headers_limited(recv, MAX_HEADERS).await?;
 
     let header_str = std::str::from_utf8(&header_buf)
         .with_context(|| "static: non-UTF-8 headers")?;
     let mut content_length: usize = 0;
     let mut connection_close = false;
+    let mut connection_keep_alive = false;
     for line in header_str.split(['\n']) {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
@@ -229,10 +209,17 @@ async fn read_request<R: AsyncReadExt + Unpin>(recv: &mut R) -> Result<Option<Re
                 content_length = v.parse().with_context(|| {
                     format!("static: bad Content-Length {v:?}")
                 })?;
-            } else if k.eq_ignore_ascii_case("connection")
-                && v.eq_ignore_ascii_case("close")
-            {
-                connection_close = true;
+            } else if k.eq_ignore_ascii_case("connection") {
+                // Connection is a comma-separated list of tokens; we care
+                // about `close` and `keep-alive`.
+                for tok in v.split(',') {
+                    let tok = tok.trim();
+                    if tok.eq_ignore_ascii_case("close") {
+                        connection_close = true;
+                    } else if tok.eq_ignore_ascii_case("keep-alive") {
+                        connection_keep_alive = true;
+                    }
+                }
             }
         }
     }
@@ -254,14 +241,110 @@ async fn read_request<R: AsyncReadExt + Unpin>(recv: &mut R) -> Result<Option<Re
         }
     }
 
-    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
-    let keep_alive = !connection_close && (version == "HTTP/1.1" || version == "HTTP/1.0");
+    // HTTP/1.1 defaults to keep-alive (peer can opt out with `Connection: close`).
+    // HTTP/1.0 defaults to close (peer must opt in with `Connection: keep-alive`).
+    let keep_alive = match version {
+        "HTTP/1.1" => !connection_close,
+        "HTTP/1.0" => connection_keep_alive,
+        _ => false,
+    };
 
     Ok(Some(Request {
         method,
         path,
         keep_alive,
     }))
+}
+
+/// Read bytes from `recv` until `delim` is found or `max` bytes are
+/// accumulated. Returns `Ok(None)` on clean EOF before any data.
+async fn read_until_limited<R: AsyncBufReadExt + Unpin>(
+    recv: &mut R,
+    delim: u8,
+    max: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let chunk = recv.fill_buf().await?;
+        if chunk.is_empty() {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Err(anyhow!("static: peer closed mid-line"))
+            };
+        }
+        match chunk.iter().position(|&b| b == delim) {
+            Some(pos) => {
+                let take = pos + 1;
+                if buf.len() + take > max {
+                    return Err(anyhow!("static: line exceeded {max} bytes"));
+                }
+                buf.extend_from_slice(&chunk[..take]);
+                recv.consume(take);
+                return Ok(Some(buf));
+            }
+            None => {
+                if buf.len() + chunk.len() > max {
+                    return Err(anyhow!("static: line exceeded {max} bytes"));
+                }
+                let len = chunk.len();
+                buf.extend_from_slice(chunk);
+                recv.consume(len);
+            }
+        }
+    }
+}
+
+/// Read HTTP headers (up to and including `\r\n\r\n` or `\n\n`) with a
+/// hard size cap. Returns an explicit error if the cap is hit so we
+/// never buffer unbounded data.
+async fn read_headers_limited<R: AsyncBufReadExt + Unpin>(
+    recv: &mut R,
+    max: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let chunk = recv.fill_buf().await?;
+        if chunk.is_empty() {
+            return Err(anyhow!("static: peer closed mid-headers"));
+        }
+        if let Some(end) = find_header_terminator(chunk) {
+            let take = end + 1;
+            if buf.len() + take > max {
+                return Err(anyhow!("static: headers exceeded {max} bytes"));
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            recv.consume(take);
+            return Ok(buf);
+        }
+        if buf.len() + chunk.len() > max {
+            return Err(anyhow!("static: headers exceeded {max} bytes"));
+        }
+        let len = chunk.len();
+        buf.extend_from_slice(chunk);
+        recv.consume(len);
+    }
+}
+
+/// Return the index of the LAST byte of the first header-terminator
+/// (`\r\n\r\n` or bare `\n\n`) in `chunk`, or `None` if absent.
+fn find_header_terminator(chunk: &[u8]) -> Option<usize> {
+    for i in 0..chunk.len() {
+        // `\r\n\r\n`
+        if i + 3 < chunk.len()
+            && chunk[i] == b'\r'
+            && chunk[i + 1] == b'\n'
+            && chunk[i + 2] == b'\r'
+            && chunk[i + 3] == b'\n'
+        {
+            return Some(i + 3);
+        }
+        // `\n\n`
+        if i + 1 < chunk.len() && chunk[i] == b'\n' && chunk[i + 1] == b'\n' {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +358,7 @@ struct Response {
     body: Vec<u8>,
 }
 
-fn error_response(status: u16, method: &str) -> Response {
+fn error_response(status: u16, method: &str, keep_alive: bool) -> Response {
     let body_text = match status {
         400 => "400 Bad Request",
         403 => "403 Forbidden",
@@ -289,6 +372,7 @@ fn error_response(status: u16, method: &str) -> Response {
     } else {
         format!("{body_text}\n").into_bytes()
     };
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     Response {
         status,
         status_text: match status {
@@ -302,7 +386,7 @@ fn error_response(status: u16, method: &str) -> Response {
         headers: vec![
             ("Content-Type".into(), "text/plain; charset=utf-8".into()),
             ("Content-Length".into(), body.len().to_string()),
-            ("Connection".into(), "close".into()),
+            ("Connection".into(), conn.into()),
         ],
         body,
     }
@@ -312,6 +396,8 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
     if req.method != "GET" && req.method != "HEAD" {
         return Err(405);
     }
+
+    let conn = if req.keep_alive { "keep-alive" } else { "close" };
 
     // Strip query string and fragment from the path before mapping to disk.
     let raw_path = req.path.split('?').next().unwrap_or(&req.path);
@@ -358,7 +444,7 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
             headers: vec![
                 ("Content-Type".into(), "text/html; charset=utf-8".into()),
                 ("Content-Length".into(), advertised_len.to_string()),
-                ("Connection".into(), "close".into()),
+                ("Connection".into(), conn.into()),
             ],
             body: if req.method == "HEAD" { Vec::new() } else { body },
         })
@@ -375,7 +461,7 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
             headers: vec![
                 ("Content-Type".into(), guess_content_type(&target).into()),
                 ("Content-Length".into(), advertised_len.to_string()),
-                ("Connection".into(), "close".into()),
+                ("Connection".into(), conn.into()),
             ],
             body: if req.method == "HEAD" { Vec::new() } else { body },
         })
@@ -591,7 +677,8 @@ mod tests {
         let (a, mut b) = duplex(4096);
         // `a` is the server side; the server reads from `a_recv` and
         // writes to `a_send`. `b` is the client side.
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec.clone();
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -641,7 +728,8 @@ mod tests {
         };
 
         let (a, mut b) = duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec;
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -687,7 +775,8 @@ mod tests {
         };
 
         let (a, mut b) = duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec;
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -727,7 +816,8 @@ mod tests {
         };
 
         let (a, mut b) = duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec;
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -770,7 +860,8 @@ mod tests {
         };
 
         let (a, mut b) = duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec;
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -812,7 +903,8 @@ mod tests {
         };
 
         let (a, mut b) = duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
         let spec_clone = spec;
         let req_clone = req;
         let server = tokio::spawn(async move {
@@ -836,5 +928,158 @@ mod tests {
         assert!(text.contains("a.txt"));
         assert!(text.contains("b.txt"));
         let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_connection_keep_alive_for_http11() {
+        let (_a, mut b) = duplex(4096);
+        let (_a_recv, mut a_send) = tokio::io::split(_a);
+        let writer = tokio::spawn(async move {
+            a_send
+                .write_all(
+                    b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = a_send.shutdown().await;
+        });
+
+        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        writer.await.unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/foo");
+        assert!(req.keep_alive, "HTTP/1.1 default is keep-alive");
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_connection_close_for_http11() {
+        let (_a, mut b) = duplex(4096);
+        let (_a_recv, mut a_send) = tokio::io::split(_a);
+        let writer = tokio::spawn(async move {
+            a_send
+                .write_all(
+                    b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = a_send.shutdown().await;
+        });
+
+        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        writer.await.unwrap();
+        assert!(!req.keep_alive);
+    }
+
+    #[tokio::test]
+    async fn read_request_defaults_http10_to_close() {
+        let (_a, mut b) = duplex(4096);
+        let (_a_recv, mut a_send) = tokio::io::split(_a);
+        let writer = tokio::spawn(async move {
+            a_send
+                .write_all(b"GET /foo HTTP/1.0\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = a_send.shutdown().await;
+        });
+
+        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        writer.await.unwrap();
+        assert!(!req.keep_alive, "HTTP/1.0 default is close");
+    }
+
+    #[tokio::test]
+    async fn read_request_opts_in_http10_with_keep_alive() {
+        let (_a, mut b) = duplex(4096);
+        let (_a_recv, mut a_send) = tokio::io::split(_a);
+        let writer = tokio::spawn(async move {
+            a_send
+                .write_all(
+                    b"GET /foo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = a_send.shutdown().await;
+        });
+
+        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        writer.await.unwrap();
+        assert!(req.keep_alive);
+    }
+
+    #[tokio::test]
+    async fn serve_one_echoes_keep_alive_in_response_header() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "BODY").unwrap();
+        let spec = StaticSpec {
+            name: "files".into(),
+            root_dir: dir.path().to_path_buf(),
+            allow_directory_listing: false,
+            shared_secret: b"unused".to_vec(),
+        };
+        let req = Request {
+            method: "GET".into(),
+            path: "/hello.txt".into(),
+            keep_alive: true,
+        };
+
+        let (a, mut b) = duplex(4096);
+        let (a_recv, mut a_send) = tokio::io::split(a);
+        let mut a_recv = BufReader::new(a_recv);
+        let server = tokio::spawn(async move {
+            let r = serve_one(&spec, &mut a_send, &mut a_recv).await;
+            let _ = a_send.shutdown().await;
+            r
+        });
+
+        let req_bytes = format!(
+            "{} {} HTTP/1.1\r\nHost: example\r\n\r\n",
+            req.method, req.path
+        );
+        b.write_all(req_bytes.as_bytes()).await.unwrap();
+        let _ = b.shutdown().await;
+
+        let mut response = Vec::new();
+        b.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response).into_owned();
+        assert!(text.contains("Connection: keep-alive"));
+        assert!(text.starts_with("HTTP/1.1 200"));
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_until_limited_rejects_runaway_line() {
+        // Feed 9 KiB of non-newline bytes and confirm the helper bails
+        // out instead of buffering forever.
+        let (_client, mut server) = tokio::io::duplex(16 * 1024);
+        let payload = vec![b'X'; 9 * 1024];
+        let value = payload.clone();
+        let writer = tokio::spawn(async move {
+            server.write_all(&value).await.unwrap();
+        });
+        let err = read_until_limited(&mut BufReader::new(_client), b'\n', 8 * 1024)
+            .await
+            .unwrap_err();
+        writer.abort();
+        assert!(format!("{err:#}").contains("line exceeded"));
+    }
+
+    #[tokio::test]
+    async fn read_headers_limited_rejects_runaway_headers() {
+        let (_client, mut server) = tokio::io::duplex(16 * 1024);
+        let mut payload = Vec::new();
+        // 16 KiB of headers with no terminator.
+        for _ in 0..(16 * 1024 / 5) {
+            payload.extend_from_slice(b"X: y\r\n");
+        }
+        let n = payload.len();
+        assert!(n > 8 * 1024);
+        let writer = tokio::spawn(async move {
+            server.write_all(&payload).await.unwrap();
+        });
+        let err = read_headers_limited(&mut BufReader::new(_client), 8 * 1024)
+            .await
+            .unwrap_err();
+        writer.abort();
+        assert!(format!("{err:#}").contains("headers exceeded"));
     }
 }

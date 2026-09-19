@@ -2,13 +2,14 @@
 
 mod consume;
 mod expose;
+mod status;
 mod static_http;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -51,8 +52,19 @@ struct RunArgs {
     config: PathBuf,
 
     /// Print client status as JSON and exit.
+    ///
+    /// The client is started normally (endpoint bound, registration
+    /// spawned) and we wait up to `--status-timeout` seconds for the
+    /// control plane to reach a settled state (Registered or
+    /// Reconnecting) before printing and exiting. Exits 0 on
+    /// Registered, 1 otherwise.
     #[arg(long)]
     status: bool,
+
+    /// How long `--status` waits for the first control-plane state
+    /// change before giving up and printing whatever we have.
+    #[arg(long, default_value_t = 10)]
+    status_timeout_secs: u64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -88,6 +100,7 @@ async fn real_main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run(RunArgs {
         config: PathBuf::from("client.toml"),
         status: false,
+        status_timeout_secs: 10,
     })) {
         Command::Id(args) => {
             return run_id(args).await;
@@ -141,17 +154,20 @@ async fn run_client(cli: RunArgs) -> Result<()> {
 
     let (secret_key, node_id) = expose::load_identity_for_client(cfg.common.identity_path.as_deref())?;
 
+    // Shared runtime status. Constructed before `--status` so the dump
+    // can include the default runtime entries; cloned into the
+    // registration and consume tasks so live state shows up in later
+    // snapshots (e.g. an HTTP status endpoint we may add later).
+    let status = status::RuntimeStatus::new(
+        cfg.consume.iter().map(|c| c.name.clone()),
+    );
+
     let server_node_id: EndpointId = cfg
         .server_node_id
         .as_ref()
         .context("client config missing server_node_id")?
         .parse()
         .context("parse server_node_id")?;
-
-    if cli.status {
-        print_status(&cfg, &node_id);
-        return Ok(());
-    }
 
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
@@ -233,8 +249,12 @@ async fn run_client(cli: RunArgs) -> Result<()> {
 
     {
         let endpoint = endpoint.clone();
+        let status = status.clone();
         tokio::spawn(async move {
             loop {
+                status
+                    .set_control_state(status::ControlState::Registering, None)
+                    .await;
                 match expose::register_with_server(
                     &endpoint,
                     server_node_id,
@@ -247,6 +267,9 @@ async fn run_client(cli: RunArgs) -> Result<()> {
                 {
                     Ok(conn) => {
                         info!("registered with server");
+                        status
+                            .set_control_state(status::ControlState::Registered, None)
+                            .await;
                         // Keep the session alive: periodically open a
                         // bi-stream and write a Heartbeat frame. Mirrors
                         // the server's hb_task in server/src/control.rs.
@@ -254,6 +277,25 @@ async fn run_client(cli: RunArgs) -> Result<()> {
                         // outer loop reconnects (after dropping the conn,
                         // which signals the server).
                         let conn = conn;
+                        // The server pushes periodic Heartbeats to us on
+                        // the SAME control connection by calling
+                        // `conn.open_bi()` from its heartbeat task. iroh
+                        // does not auto-drain those streams, so we must
+                        // keep accepting bi-streams here or the server's
+                        // heartbeat writer eventually deadlocks on flow
+                        // control. Read the incoming frame and let the
+                        // stream close naturally (the server shuts its
+                        // send side down after writing).
+                        let drain_conn = conn.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let (_send, mut recv) = match drain_conn.accept_bi().await {
+                                    Ok(p) => p,
+                                    Err(_) => return,
+                                };
+                                let _ = Frame::read_from(&mut recv).await;
+                            }
+                        });
                         loop {
                             tokio::time::sleep(CLIENT_HEARTBEAT_INTERVAL).await;
                             let (mut s, _r) = match conn.open_bi().await {
@@ -268,10 +310,15 @@ async fn run_client(cli: RunArgs) -> Result<()> {
                                 break;
                             }
                             let _ = s.shutdown().await;
+                            status.record_heartbeat().await;
                         }
                     }
                     Err(e) => {
                         warn!(err = %e, "register with server failed; retry in 5s");
+                        let msg = format!("{e:#}");
+                        status
+                            .set_control_state(status::ControlState::Reconnecting, Some(&msg))
+                            .await;
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
                 }
@@ -280,9 +327,20 @@ async fn run_client(cli: RunArgs) -> Result<()> {
     }
 
     // Spawn a task for each consume service.
+    // Clamp user-provided backoff to sane lower bounds. Without this a
+    // typo like `initial_backoff_ms = 0` would hot-loop the consume
+    // task on a missing provider.
     let reconnect = consume::ReconnectConfig {
-        initial_backoff_ms: cfg.reconnect.initial_backoff_ms.max(10),
-        max_backoff_ms: cfg.reconnect.max_backoff_ms.max(100),
+        initial_backoff_ms: clamp_backoff(
+            "reconnect.initial_backoff_ms",
+            cfg.reconnect.initial_backoff_ms,
+            10,
+        ),
+        max_backoff_ms: clamp_backoff(
+            "reconnect.max_backoff_ms",
+            cfg.reconnect.max_backoff_ms,
+            100,
+        ),
         prefer_direct: cfg.reconnect.prefer_direct,
     };
     for c in &cfg.consume {
@@ -295,8 +353,9 @@ async fn run_client(cli: RunArgs) -> Result<()> {
             server_node_id,
             group_token: cfg.group_token.clone().unwrap_or_default(),
             endpoint: endpoint.clone(),
-            conn: tokio::sync::Mutex::new(None),
+            cached_provider: tokio::sync::Mutex::new(None),
             reconnect,
+            status: status.clone(),
         });
         let state2 = state.clone();
         tokio::spawn(async move {
@@ -306,12 +365,70 @@ async fn run_client(cli: RunArgs) -> Result<()> {
         });
     }
 
+    if cli.status {
+        let exit = status_query(&cfg, &node_id, &status, cli.status_timeout_secs).await;
+        endpoint.close().await;
+        return exit;
+    }
+
     tokio::signal::ctrl_c().await.ok();
     info!("ctrl-c received; shutting down");
     Ok(())
 }
 
-fn print_status(cfg: &RootConfig, node_id: &str) {
+/// Wait for the first settled control-plane state, dump the runtime
+/// snapshot, and return Ok(()) only when the state is `Registered`.
+/// Used by `--status`.
+async fn status_query(
+    cfg: &RootConfig,
+    node_id: &str,
+    status: &status::RuntimeStatus,
+    timeout_secs: u64,
+) -> Result<()> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snap = status.snapshot().await;
+        if matches!(
+            snap.control.state,
+            status::ControlState::Registered | status::ControlState::Reconnecting
+        ) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    print_status(cfg, node_id, status).await;
+    let snap = status.snapshot().await;
+    if matches!(snap.control.state, status::ControlState::Registered) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "control plane did not reach Registered within {}s (state={:?})",
+            timeout_secs,
+            snap.control.state
+        ))
+    }
+}
+
+fn clamp_backoff(field: &'static str, configured: u64, floor: u64) -> u64 {
+    if configured < floor {
+        warn!(
+            field,
+            configured,
+            floor,
+            "{field} below sane minimum; clamping to {floor}ms",
+        );
+        floor
+    } else {
+        configured
+    }
+}
+
+async fn print_status(cfg: &RootConfig, node_id: &str, status: &status::RuntimeStatus) {
+    let snapshot = status.snapshot().await;
     let out = serde_json::json!({
         "node_id": node_id,
         "server_node_id": cfg.server_node_id,
@@ -328,6 +445,7 @@ fn print_status(cfg: &RootConfig, node_id: &str) {
             "name": c.name,
             "local_bind": c.local_bind.to_string(),
         })).collect::<Vec<_>>(),
+        "runtime": snapshot,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into()));
 }
