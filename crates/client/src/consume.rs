@@ -266,6 +266,12 @@ async fn dial_direct(
     // we do not need a second stream and do not leak an unauthenticated
     // one into the provider's handler.
     let (mut send, mut recv) = conn.open_bi().await?;
+    // Quinn's bi-stream handshake only progresses once the caller of
+    // `open_bi()` writes to its `SendStream`; the peer cannot observe
+    // `accept_bi()` returning until that first write lands. We send an
+    // empty `AuthHello` frame first to unblock the provider side
+    // before we block waiting for its `AuthNonce` reply.
+    Frame::AuthHello.write_to(&mut send).await.context("write auth hello")?;
     let nonce_frame = Frame::read_from(&mut recv).await?;
     let nonce = match nonce_frame {
         Frame::AuthNonce(AuthNonce { nonce }) => nonce,
@@ -314,9 +320,20 @@ async fn dial_relay(
     .await?;
     // 2. The provider runs an HMAC handshake on the first bi-stream it
     //    accepts. The server's relay handler byte-bridges the two
-    //    streams, so the AuthNonce / AuthProof / AuthOk frames flow
-    //    transparently through it. We perform the same handshake the
-    //    direct path uses, on the same stream we will then bridge.
+    //    streams, so the AuthHello / AuthNonce / AuthProof / AuthOk
+    //    frames flow transparently through it.
+    //
+    //    Write AuthHello immediately after DataOpen so the bytes
+    //    reach the relay server's outbound (which is feeding the
+    //    server→provider stream) — this is what unblocks the
+    //    provider's `accept_bi()` on the relayed stream. Without it
+    //    both sides block: the relay can't deliver a SYN to the
+    //    provider (the server-to-provider `open_bi` hasn't written
+    //    anything) and the provider can't proceed.
+    Frame::AuthHello
+        .write_to(&mut send)
+        .await
+        .context("relay: write auth hello")?;
     let nonce_frame = Frame::read_from(&mut recv).await?;
     let nonce = match nonce_frame {
         Frame::AuthNonce(AuthNonce { nonce }) => nonce,

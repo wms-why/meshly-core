@@ -32,6 +32,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // Tag constants
 // ---------------------------------------------------------------------------
 
+/// Data-plane tag: client hello to trigger provider's `accept_bi`.
+pub const DATA_AUTH_HELLO: u8 = 0x06;
 /// Data-plane tag: server-issued nonce.
 pub const DATA_AUTH_NONCE: u8 = 0x01;
 /// Data-plane tag: client-issued HMAC proof.
@@ -177,6 +179,19 @@ pub struct SubscribeOk {
 /// it back to the wire.
 #[derive(Debug, Clone)]
 pub enum Frame {
+    /// AuthHello (data plane): client → server, sent immediately after
+    /// `open_bi()` to unblock the peer side's `accept_bi()`.
+    ///
+    /// Quinn's bi-stream handshake only progresses once the caller of
+    /// `open_bi()` writes to its `SendStream`; the peer cannot observe
+    /// `accept_bi()` returning until that first write lands. The
+    /// server-side handshake begins with reading this frame, so the
+    /// consumer MUST send `AuthHello` as the very first frame on a
+    /// fresh bi-stream before reading anything.
+    ///
+    /// Carries no payload — it exists solely to push bytes onto the
+    /// stream so `accept_bi()` can complete.
+    AuthHello,
     AuthNonce(AuthNonce),
     AuthProof(AuthProof),
     AuthOk(AuthOk),
@@ -212,6 +227,7 @@ impl Frame {
     /// Returns the tag byte for this frame.
     pub fn tag(&self) -> u8 {
         match self {
+            Frame::AuthHello => DATA_AUTH_HELLO,
             Frame::AuthNonce(_) => DATA_AUTH_NONCE,
             Frame::AuthProof(_) => DATA_AUTH_PROOF,
             Frame::AuthOk(_) => DATA_AUTH_OK,
@@ -232,6 +248,7 @@ impl Frame {
     pub fn encode_payload(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = BytesMut::new();
         match self {
+            Frame::AuthHello => {}
             Frame::AuthNonce(a) => out.put_slice(&a.nonce),
             Frame::AuthProof(p) => out.put_slice(&p.mac),
             Frame::AuthOk(_) => {}
@@ -284,6 +301,12 @@ impl Frame {
     pub fn decode(tag: u8, payload: &[u8]) -> Result<Frame, FrameError> {
         let cur = payload;
         let frame = match tag {
+            DATA_AUTH_HELLO => {
+                if !payload.is_empty() {
+                    return Err(FrameError::ShortPayload(0, payload.len()));
+                }
+                Frame::AuthHello
+            }
             DATA_AUTH_NONCE => {
                 let n: [u8; 32] = payload
                     .try_into()
@@ -640,6 +663,7 @@ mod tests {
     #[tokio::test]
     async fn frame_round_trip_all_variants() {
         let cases: Vec<Frame> = vec![
+            Frame::AuthHello,
             Frame::AuthNonce(AuthNonce { nonce: [1u8; 32] }),
             Frame::AuthProof(AuthProof { mac: [2u8; 32] }),
             Frame::AuthOk(AuthOk),

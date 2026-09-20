@@ -172,4 +172,112 @@ mod tests {
         assert_eq!(s.forwarded_streams, 1);
         assert!(s.last_error.is_none());
     }
+
+    // -- Phase 0: snapshot transition paths -------------------------------
+
+    #[tokio::test]
+    async fn consumer_transitions_idle_to_dialing_to_live_direct() {
+        let rt = RuntimeStatus::new(vec!["svc".to_string()]);
+        // Start: Idle (default after new()).
+        let s0 = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s0.state, ConsumerState::Idle);
+        assert!(s0.last_error.is_none());
+        assert_eq!(s0.forwarded_streams, 0);
+
+        // Dialing with no mode, no error.
+        rt.set_consumer_state("svc", ConsumerState::Dialing, None, None)
+            .await;
+        let s1 = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s1.state, ConsumerState::Dialing);
+        assert!(s1.last_attempt_at_ms.is_some());
+
+        // Live on the direct path.
+        rt.set_consumer_state("svc", ConsumerState::Live, Some("direct"), None)
+            .await;
+        let s2 = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s2.state, ConsumerState::Live);
+        assert_eq!(s2.mode.as_deref(), Some("direct"));
+        assert!(s2.last_success_at_ms.is_some());
+        assert_eq!(s2.forwarded_streams, 1);
+    }
+
+    #[tokio::test]
+    async fn consumer_transitions_idle_to_dialing_to_live_relay() {
+        let rt = RuntimeStatus::new(vec!["svc".to_string()]);
+        rt.set_consumer_state("svc", ConsumerState::Dialing, None, None)
+            .await;
+        rt.set_consumer_state("svc", ConsumerState::Live, Some("relay"), None)
+            .await;
+        let s = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s.state, ConsumerState::Live);
+        assert_eq!(s.mode.as_deref(), Some("relay"));
+        assert_eq!(s.forwarded_streams, 1);
+        assert!(s.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn consumer_failed_records_last_error_then_back_to_live_clears() {
+        let rt = RuntimeStatus::new(vec!["svc".to_string()]);
+        rt.set_consumer_state("svc", ConsumerState::Dialing, None, None)
+            .await;
+        rt.set_consumer_state(
+            "svc",
+            ConsumerState::Failed,
+            None,
+            Some("relay dial failed: timeout"),
+        )
+        .await;
+
+        let s_failed = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s_failed.state, ConsumerState::Failed);
+        assert!(
+            s_failed
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timeout"),
+            "last_error should contain 'timeout', got {:?}",
+            s_failed.last_error
+        );
+        // Forwarded streams must NOT have incremented on Failed.
+        assert_eq!(s_failed.forwarded_streams, 0);
+
+        // Recovery: back to Live clears the error and increments counter.
+        rt.set_consumer_state("svc", ConsumerState::Live, Some("relay"), None)
+            .await;
+        let s_live = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s_live.state, ConsumerState::Live);
+        assert!(
+            s_live.last_error.is_none(),
+            "transition to Live must clear last_error, got {:?}",
+            s_live.last_error
+        );
+        assert_eq!(s_live.forwarded_streams, 1);
+    }
+
+    #[tokio::test]
+    async fn consumer_multiple_failed_to_live_cycles_increment() {
+        // Each successful Live transition increments the counter;
+        // intermediate Failed states do not.
+        let rt = RuntimeStatus::new(vec!["svc".to_string()]);
+
+        for i in 0..3 {
+            rt.set_consumer_state("svc", ConsumerState::Dialing, None, None)
+                .await;
+            rt.set_consumer_state(
+                "svc",
+                ConsumerState::Failed,
+                None,
+                Some(&format!("err {i}")),
+            )
+            .await;
+            rt.set_consumer_state("svc", ConsumerState::Live, Some("direct"), None)
+                .await;
+        }
+
+        let s = &rt.snapshot().await.consumers["svc"];
+        assert_eq!(s.state, ConsumerState::Live);
+        assert_eq!(s.forwarded_streams, 3);
+        assert!(s.last_error.is_none());
+    }
 }

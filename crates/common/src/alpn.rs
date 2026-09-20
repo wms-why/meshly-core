@@ -119,4 +119,93 @@ mod tests {
         assert!(validate_service_name("a").is_ok());
         assert!(validate_service_name(&"a".repeat(32)).is_ok());
     }
+
+    // -- Phase 0: targeted edge cases for validate_service_name -----------
+
+    #[test]
+    fn rejects_empty_string() {
+        assert!(matches!(
+            validate_service_name(""),
+            Err(AlpnError::BadLength(0))
+        ));
+    }
+
+    #[test]
+    fn rejects_uppercase() {
+        // Any uppercase letter must be rejected as InvalidChars.
+        for name in ["Ssh", "sSh", "ssH", "WEB", "My-Service"] {
+            assert!(
+                matches!(validate_service_name(name), Err(AlpnError::InvalidChars(_))),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_leading_and_trailing_hyphen() {
+        assert!(matches!(validate_service_name("-x"), Err(AlpnError::BadEdge)));
+        assert!(matches!(validate_service_name("x-"), Err(AlpnError::BadEdge)));
+        assert!(matches!(
+            validate_service_name("-"),
+            Err(AlpnError::BadEdge)
+        ));
+    }
+
+    #[test]
+    fn rejects_double_dash_in_middle() {
+        assert!(matches!(
+            validate_service_name("ss--h"),
+            Err(AlpnError::DoubleDash)
+        ));
+        // Leading `--` should be caught by BadEdge first (leading hyphen),
+        // not DoubleDash, since we check edges before `--`.
+        assert!(matches!(validate_service_name("--ssh"), Err(AlpnError::BadEdge)));
+        // Trailing `--` likewise is caught by BadEdge (trailing hyphen).
+        assert!(matches!(validate_service_name("ssh--"), Err(AlpnError::BadEdge)));
+    }
+
+    #[test]
+    fn rejects_all_reserved_names() {
+        for name in [
+            "control", "data", "status", "reload", "admin", "metrics", "ping",
+        ] {
+            assert!(
+                matches!(validate_service_name(name), Err(AlpnError::Reserved(_))),
+                "{name:?} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_thirty_three_char_name() {
+        let name = "a".repeat(33);
+        assert!(matches!(
+            validate_service_name(&name),
+            Err(AlpnError::BadLength(33))
+        ));
+    }
+
+    #[test]
+    fn accepts_mixed_lowercase_letters_digits_and_hyphens() {
+        // Hyphens between word characters are fine; digits OK.
+        for name in ["web", "ssh-22", "my-service-1", "1thing", "a-b-c"] {
+            assert!(
+                validate_service_name(name).is_ok(),
+                "{name:?} should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_underscore_and_dot() {
+        // Only [a-z0-9-] is allowed; underscore and dot are not.
+        assert!(matches!(
+            validate_service_name("ssh_22"),
+            Err(AlpnError::InvalidChars(_))
+        ));
+        assert!(matches!(
+            validate_service_name("ssh.22"),
+            Err(AlpnError::InvalidChars(_))
+        ));
+    }
 }

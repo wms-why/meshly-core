@@ -165,4 +165,95 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    // -- Phase 0: targeted idempotency + permission tests -----------------
+
+    /// `load_or_generate_at` must be idempotent: two calls on the same
+    /// path return the *same* SecretKey (not just the same public key).
+    /// The second call must not generate a new key over the existing one.
+    #[test]
+    fn load_or_generate_at_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "meshly-core-idem-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let key_file = tmp.join("identity.key");
+        let (k1, _) = load_or_generate_at(&key_file).unwrap();
+        let bytes_after_first = std::fs::read(&key_file).unwrap();
+
+        // Second call must reuse the on-disk key, not overwrite.
+        let (k2, paths2) = load_or_generate_at(&key_file).unwrap();
+        let bytes_after_second = std::fs::read(&key_file).unwrap();
+
+        assert_eq!(
+            k1.to_bytes(),
+            k2.to_bytes(),
+            "SecretKey bytes must be identical across calls"
+        );
+        assert_eq!(
+            bytes_after_first, bytes_after_second,
+            "file bytes must not be rewritten on second load"
+        );
+        assert_eq!(paths2.key_file, key_file);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// When the identity file does not exist, a new key must be generated
+    /// and persisted. Use a fresh subdirectory under tempdir so the test
+    /// cannot collide with another test or the developer's real key.
+    #[test]
+    fn load_or_generate_at_creates_new_key_when_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "meshly-core-newkey-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>() ^ 0xc0ffee
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let key_file = tmp.join("fresh.identity.key");
+        assert!(!key_file.exists(), "precondition: file must not exist");
+
+        let (key, paths) = load_or_generate_at(&key_file).unwrap();
+        assert!(key_file.exists(), "file must be created");
+        assert_eq!(paths.key_file, key_file);
+
+        // The on-disk content must be 32 bytes (the raw SecretKey bytes).
+        let bytes = std::fs::read(&key_file).unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes, key.to_bytes());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// On Unix, the freshly created identity file must be readable and
+    /// writable by the owner only (mode 0o600). This is a security
+    /// requirement — the private key must not be world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_at_chmods_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "meshly-core-perms-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>() ^ 0xface
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let key_file = tmp.join("perms.identity.key");
+        let (_, _) = load_or_generate_at(&key_file).unwrap();
+
+        let meta = std::fs::metadata(&key_file).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected mode 0o600, got {mode:o} ({mode})"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

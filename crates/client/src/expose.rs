@@ -65,6 +65,20 @@ impl ExposeHandler {
 
         // We accept the first bi-stream and run the auth handshake.
         let (mut send, mut recv) = conn.accept_bi().await?;
+        // The consumer must send `AuthHello` first to trigger our
+        // `accept_bi()` returning (Quinn's bi-stream handshake only
+        // progresses once the caller of `open_bi()` writes to its
+        // SendStream). We read and discard the AuthHello marker
+        // before proceeding; anything else here is a protocol error
+        // and we bail out cleanly.
+        match Frame::read_from(&mut recv).await? {
+            Frame::AuthHello => {}
+            other => {
+                warn!(service = %self.spec.name, got = ?other,
+                    "expose: expected AuthHello as first frame");
+                return Ok(());
+            }
+        }
         // Send nonce.
         let mut nonce = [0u8; 32];
         rand::Rng::fill(&mut rand::rngs::OsRng, &mut nonce[..]);
