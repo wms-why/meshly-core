@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
 
 /// Bytes-per-direction summary returned by [`bridge`].
@@ -26,6 +26,12 @@ pub struct BridgeStats {
 /// Both `a` and `b` must be `(AsyncRead + AsyncWrite + Unpin)`. For Iroh
 /// streams pass the `(RecvStream, SendStream)` tuple directly — Rust
 /// resolves them as separate `&mut` references to the two halves.
+///
+/// The two copy directions run concurrently (via `tokio::join!`) so that
+/// interactive protocols work: e.g. an SSH client writes bytes and then
+/// waits for the server's response, which can only arrive if the
+/// `b→a` direction is pumping while `a→b` is also pumping. A sequential
+/// implementation deadlocks in that pattern.
 pub async fn bridge<A, B>(a: A, b: B) -> io::Result<BridgeStats>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -35,34 +41,43 @@ where
     let mut b = b;
     let started = Instant::now();
 
-    let a_to_b = copy_one_direction(&mut a, &mut b).await?;
+    // Run both directions concurrently. `copy_bidirectional` polls
+    // both directions in a single future and returns when BOTH have
+    // reached EOF or any side errored.
+    //
+    // This is the only correct shape for an interactive protocol like
+    // SSH where the client writes a request and then waits for a
+    // response: that response can only flow if `b→a` is actively
+    // pumping while `a→b` is also pumping. A sequential
+    // a-to-b-then-b-to-a implementation deadlocks on this pattern,
+    // because a-to-b blocks waiting for backend bytes that never
+    // arrive until b-to-a drains the QUIC→backend path.
+    //
+    // Note: when one direction's reader reaches EOF, copy_bidirectional
+    // calls `shutdown()` on the other writer. So if the consumer
+    // half-closes its send side, copy_bidirectional will:
+    //   1. drain remaining b→a bytes (none in our case),
+    //   2. shutdown the backend's write side, which sends FIN to the
+    //      backend's peer,
+    //   3. drain a→b until backend's read returns 0,
+    //   4. shutdown the QUIC send side, which sends FIN to the consumer.
+    // That FIN-then-EOF handoff is exactly what unblocks the consumer's
+    // recv.read_exact() — the bridge returns AFTER the response bytes
+    // have been written to the QUIC send stream.
+    let (a_to_b, b_to_a) = tokio::io::copy_bidirectional(&mut a, &mut b).await?;
     debug!(bytes = a_to_b, "a->b closed");
-    let b_to_a = copy_one_direction(&mut b, &mut a).await?;
     debug!(bytes = b_to_a, "b->a closed");
 
+    // copy_bidirectional has already shut down the writers it owned.
+    // Calling again is a no-op (idempotent shutdown) but we keep the
+    // calls defensively so the bridge is safe to use outside the
+    // copy_bidirectional-driven path.
     let _ = a.shutdown().await;
     let _ = b.shutdown().await;
 
     let stats = BridgeStats { a_to_b, b_to_a };
     trace!(?stats, elapsed_ms = started.elapsed().as_millis() as u64, "bridge done");
     Ok(stats)
-}
-
-async fn copy_one_direction<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 16 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(total);
-        }
-        writer.write_all(&buf[..n]).await?;
-        total += n as u64;
-    }
 }
 
 /// Combined bi-directional stream from a separate recv/send pair.

@@ -19,7 +19,6 @@ mod control;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::address_lookup::memory::MemoryLookup;
 use iroh::EndpointId;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;

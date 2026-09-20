@@ -184,7 +184,8 @@ async fn forward_one(state: Arc<ConsumeState>, tcp: tokio::net::TcpStream) -> Re
 /// Retries with exponential backoff on transient failure. The cached
 /// provider EndpointId is refreshed if direct auth fails (likely
 /// because the provider restarted under a new identity).
-async fn dial_stream(
+#[doc(hidden)]
+pub async fn dial_stream(
     state: &Arc<ConsumeState>,
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     let name = state.spec.name.clone();
@@ -249,7 +250,8 @@ fn is_auth_error(e: &anyhow::Error) -> bool {
         || msg.contains("AuthErr")
 }
 
-async fn dial_direct(
+#[doc(hidden)]
+pub async fn dial_direct(
     state: &Arc<ConsumeState>,
     provider_id: EndpointId,
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
@@ -284,19 +286,31 @@ async fn dial_direct(
     Frame::AuthProof(AuthProof { mac: proof })
         .write_to(&mut send)
         .await?;
-    match Frame::read_from(&mut recv).await? {
-        Frame::AuthOk(AuthOk) => {
+    // Read AuthOk / AuthErr / connection close. The provider's
+    // ExposeHandler responds with AuthErr + close on bad proof; Quinn
+    // may tear the connection down before the AuthErr bytes reach us
+    // (the QUIC stream buffer is dropped along with the connection).
+    // We classify both shapes as auth failure so the dial_stream
+    // is_auth_error classifier can still invalidate the cached
+    // provider id.
+    match Frame::read_from(&mut recv).await {
+        Ok(Frame::AuthOk(AuthOk)) => {
             debug!(service = %service_name, "direct auth ok");
             Ok((conn, send, recv))
         }
-        Frame::AuthErr(AuthErr { code, reason }) => {
+        Ok(Frame::AuthErr(AuthErr { code, reason })) => {
             Err(anyhow!("provider rejected proof: code={code} reason={reason}"))
         }
-        other => Err(anyhow!("expected AuthOk, got {other:?}")),
+        Ok(other) => Err(anyhow!("expected AuthOk, got {other:?}")),
+        Err(e) => Err(anyhow!(
+            "provider rejected proof: code={} reason=connection lost ({e})",
+            meshly_core_common::protocol::AUTH_ERR_BAD_PROOF
+        )),
     }
 }
 
-async fn dial_relay(
+#[doc(hidden)]
+pub async fn dial_relay(
     state: &Arc<ConsumeState>,
     provider_id: EndpointId,
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
@@ -346,15 +360,23 @@ async fn dial_relay(
     Frame::AuthProof(AuthProof { mac: proof })
         .write_to(&mut send)
         .await?;
-    match Frame::read_from(&mut recv).await? {
-        Frame::AuthOk(AuthOk) => {
+    // See `dial_direct`: the provider may tear the QUIC stream down
+    // before its AuthErr reaches us. Classify connection-lost here as
+    // auth failure too so dial_stream's is_auth_error invalidates the
+    // cached provider id.
+    match Frame::read_from(&mut recv).await {
+        Ok(Frame::AuthOk(AuthOk)) => {
             debug!(service = %state.spec.name, "relay auth ok");
             Ok((conn, send, recv))
         }
-        Frame::AuthErr(AuthErr { code, reason }) => {
+        Ok(Frame::AuthErr(AuthErr { code, reason })) => {
             Err(anyhow!("relay auth rejected: code={code} reason={reason}"))
         }
-        other => Err(anyhow!("expected AuthOk from relay, got {other:?}")),
+        Ok(other) => Err(anyhow!("expected AuthOk from relay, got {other:?}")),
+        Err(e) => Err(anyhow!(
+            "relay auth rejected: code={} reason=connection lost ({e})",
+            meshly_core_common::protocol::AUTH_ERR_BAD_PROOF
+        )),
     }
 }
 

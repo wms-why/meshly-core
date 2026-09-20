@@ -19,14 +19,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
 use meshly_core_common::protocol::{
-    verify_proof, AuthErr, AuthNonce, AuthOk, AuthProof, Frame, AUTH_ERR_BAD_PROOF,
+    AUTH_ERR_BAD_PROOF, AuthErr, AuthNonce, AuthOk, AuthProof, Frame, verify_proof,
 };
 
 /// Description of one HTTP static service.
@@ -66,7 +66,9 @@ impl StaticHandler {
         let (mut send, mut recv) = conn.accept_bi().await?;
         let mut nonce = [0u8; 32];
         rand::Rng::fill(&mut rand::rngs::OsRng, &mut nonce[..]);
-        Frame::AuthNonce(AuthNonce { nonce }).write_to(&mut send).await?;
+        Frame::AuthNonce(AuthNonce { nonce })
+            .write_to(&mut send)
+            .await?;
 
         let proof_frame = Frame::read_from(&mut recv).await?;
         let proof = match proof_frame {
@@ -100,8 +102,8 @@ impl StaticHandler {
         let mut recv = BufReader::new(recv);
         loop {
             match serve_one(&self.spec, &mut send, &mut recv).await {
-                Ok(true) => continue,    // served successfully, keep going
-                Ok(false) => break,     // peer closed; stop
+                Ok(true) => continue, // served successfully, keep going
+                Ok(false) => break,   // peer closed; stop
                 Err(e) => {
                     warn!(service = %self.spec.name, err = %e,
                         "static: serve_one failed; closing stream");
@@ -192,8 +194,8 @@ async fn read_request<R: AsyncBufReadExt + Unpin>(recv: &mut R) -> Result<Option
     // instead of an OOM.
     let header_buf = read_headers_limited(recv, MAX_HEADERS).await?;
 
-    let header_str = std::str::from_utf8(&header_buf)
-        .with_context(|| "static: non-UTF-8 headers")?;
+    let header_str =
+        std::str::from_utf8(&header_buf).with_context(|| "static: non-UTF-8 headers")?;
     let mut content_length: usize = 0;
     let mut connection_close = false;
     let mut connection_keep_alive = false;
@@ -206,9 +208,9 @@ async fn read_request<R: AsyncBufReadExt + Unpin>(recv: &mut R) -> Result<Option
             let k = k.trim();
             let v = v.trim();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().with_context(|| {
-                    format!("static: bad Content-Length {v:?}")
-                })?;
+                content_length = v
+                    .parse()
+                    .with_context(|| format!("static: bad Content-Length {v:?}"))?;
             } else if k.eq_ignore_ascii_case("connection") {
                 // Connection is a comma-separated list of tokens; we care
                 // about `close` and `keep-alive`.
@@ -397,7 +399,11 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
         return Err(405);
     }
 
-    let conn = if req.keep_alive { "keep-alive" } else { "close" };
+    let conn = if req.keep_alive {
+        "keep-alive"
+    } else {
+        "close"
+    };
 
     // Strip query string and fragment from the path before mapping to disk.
     let raw_path = req.path.split('?').next().unwrap_or(&req.path);
@@ -407,10 +413,7 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
     // Canonicalise: resolve relative to root_dir, then check that the
     // resulting path is lexically inside root_dir. Blocks ../ escapes and
     // absolute paths.
-    let root_canon = spec
-        .root_dir
-        .canonicalize()
-        .map_err(|_| 500u16)?;
+    let root_canon = spec.root_dir.canonicalize().map_err(|_| 500u16)?;
     let joined = if url_decoded.starts_with('/') || url_decoded.is_empty() {
         root_canon.join(url_decoded.trim_start_matches('/'))
     } else {
@@ -446,7 +449,11 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
                 ("Content-Length".into(), advertised_len.to_string()),
                 ("Connection".into(), conn.into()),
             ],
-            body: if req.method == "HEAD" { Vec::new() } else { body },
+            body: if req.method == "HEAD" {
+                Vec::new()
+            } else {
+                body
+            },
         })
     } else {
         let body = match std::fs::read(&target) {
@@ -463,15 +470,16 @@ fn build_response(spec: &StaticSpec, req: &Request) -> Result<Response, u16> {
                 ("Content-Length".into(), advertised_len.to_string()),
                 ("Connection".into(), conn.into()),
             ],
-            body: if req.method == "HEAD" { Vec::new() } else { body },
+            body: if req.method == "HEAD" {
+                Vec::new()
+            } else {
+                body
+            },
         })
     }
 }
 
-async fn write_response<W: AsyncWriteExt + Unpin>(
-    send: &mut W,
-    r: &Response,
-) -> Result<()> {
+async fn write_response<W: AsyncWriteExt + Unpin>(send: &mut W, r: &Response) -> Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", r.status, r.status_text);
     for (k, v) in &r.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
@@ -557,7 +565,8 @@ fn render_directory_listing(root: &Path, dir: &Path) -> std::io::Result<Vec<u8>>
     }
     entries.sort_by(|a, b| {
         // Directories first, then case-insensitive name.
-        b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
     });
 
     let rel_dir = dir.strip_prefix(root).unwrap_or(dir);
@@ -578,7 +587,9 @@ fn render_directory_listing(root: &Path, dir: &Path) -> std::io::Result<Vec<u8>>
     html.push_str(".size{text-align:right;font-variant-numeric:tabular-nums;color:#888}");
     html.push_str("</style></head><body>");
     html.push_str(&format!("<h1>Index of {title}</h1>"));
-    html.push_str("<table><thead><tr><th>Name</th><th class=\"size\">Size</th></tr></thead><tbody>");
+    html.push_str(
+        "<table><thead><tr><th>Name</th><th class=\"size\">Size</th></tr></thead><tbody>",
+    );
 
     if rel_dir.as_os_str().is_empty() {
         // root: no parent link
@@ -586,7 +597,11 @@ fn render_directory_listing(root: &Path, dir: &Path) -> std::io::Result<Vec<u8>>
         html.push_str("<tr><td><a href=\"../\">../</a></td><td class=\"size\">—</td></tr>");
     }
     for (name, is_dir, size, href) in &entries {
-        let display_name = if *is_dir { format!("{name}/") } else { name.clone() };
+        let display_name = if *is_dir {
+            format!("{name}/")
+        } else {
+            name.clone()
+        };
         let size_str = if *is_dir {
             "—".to_string()
         } else if *size < 1024 {
@@ -642,9 +657,15 @@ mod tests {
 
     #[test]
     fn guess_content_type_for_known_extensions() {
-        assert_eq!(guess_content_type(Path::new("a.html")), "text/html; charset=utf-8");
+        assert_eq!(
+            guess_content_type(Path::new("a.html")),
+            "text/html; charset=utf-8"
+        );
         assert_eq!(guess_content_type(Path::new("a.png")), "image/png");
-        assert_eq!(guess_content_type(Path::new("a.bin")), "application/octet-stream");
+        assert_eq!(
+            guess_content_type(Path::new("a.bin")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -723,7 +744,10 @@ mod tests {
         };
         let req = Request {
             method: "GET".into(),
-            path: format!("/../{}", outside_dir.path().file_name().unwrap().to_string_lossy()),
+            path: format!(
+                "/../{}",
+                outside_dir.path().file_name().unwrap().to_string_lossy()
+            ),
             keep_alive: false,
         };
 
@@ -751,10 +775,7 @@ mod tests {
         // We don't assert a specific code here — the resolver may collapse
         // the traversal into either 404 (path doesn't exist) or 403 (escapes
         // root). Either way the file content must not be served.
-        assert!(
-            !text.contains("nope"),
-            "traversal leaked content: {text}"
-        );
+        assert!(!text.contains("nope"), "traversal leaked content: {text}");
         let _ = server.await.unwrap();
     }
 
@@ -932,19 +953,20 @@ mod tests {
 
     #[tokio::test]
     async fn read_request_parses_connection_keep_alive_for_http11() {
-        let (_a, mut b) = duplex(4096);
+        let (_a, b) = duplex(4096);
         let (_a_recv, mut a_send) = tokio::io::split(_a);
         let writer = tokio::spawn(async move {
             a_send
-                .write_all(
-                    b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
-                )
+                .write_all(b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
                 .await
                 .unwrap();
             let _ = a_send.shutdown().await;
         });
 
-        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        let req = read_request(&mut BufReader::new(b))
+            .await
+            .unwrap()
+            .expect("got request");
         writer.await.unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/foo");
@@ -953,26 +975,27 @@ mod tests {
 
     #[tokio::test]
     async fn read_request_parses_connection_close_for_http11() {
-        let (_a, mut b) = duplex(4096);
+        let (_a, b) = duplex(4096);
         let (_a_recv, mut a_send) = tokio::io::split(_a);
         let writer = tokio::spawn(async move {
             a_send
-                .write_all(
-                    b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
             let _ = a_send.shutdown().await;
         });
 
-        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        let req = read_request(&mut BufReader::new(b))
+            .await
+            .unwrap()
+            .expect("got request");
         writer.await.unwrap();
         assert!(!req.keep_alive);
     }
 
     #[tokio::test]
     async fn read_request_defaults_http10_to_close() {
-        let (_a, mut b) = duplex(4096);
+        let (_a, b) = duplex(4096);
         let (_a_recv, mut a_send) = tokio::io::split(_a);
         let writer = tokio::spawn(async move {
             a_send
@@ -982,26 +1005,30 @@ mod tests {
             let _ = a_send.shutdown().await;
         });
 
-        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        let req = read_request(&mut BufReader::new(b))
+            .await
+            .unwrap()
+            .expect("got request");
         writer.await.unwrap();
         assert!(!req.keep_alive, "HTTP/1.0 default is close");
     }
 
     #[tokio::test]
     async fn read_request_opts_in_http10_with_keep_alive() {
-        let (_a, mut b) = duplex(4096);
+        let (_a, b) = duplex(4096);
         let (_a_recv, mut a_send) = tokio::io::split(_a);
         let writer = tokio::spawn(async move {
             a_send
-                .write_all(
-                    b"GET /foo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
-                )
+                .write_all(b"GET /foo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
                 .await
                 .unwrap();
             let _ = a_send.shutdown().await;
         });
 
-        let req = read_request(&mut BufReader::new(b)).await.unwrap().expect("got request");
+        let req = read_request(&mut BufReader::new(b))
+            .await
+            .unwrap()
+            .expect("got request");
         writer.await.unwrap();
         assert!(req.keep_alive);
     }
